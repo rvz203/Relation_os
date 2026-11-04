@@ -1,0 +1,12 @@
+node_modules
+.next
+.git
+.env
+.env.*
+!.env.example
+private
+build
+dist
+.sites-runtime
+outputs
+work
