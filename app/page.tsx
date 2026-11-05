@@ -53,6 +53,7 @@ import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { Toaster, toast } from "sonner";
 import {
   api,
+  apiAll,
   setCsrf,
   fa,
   contactAge,
@@ -62,7 +63,9 @@ import {
   type Action,
   type User,
 } from "@/lib/client";
-import { faDate } from "@/lib/calendar";
+import { DateField } from "@/components/workspace/date-field";
+import { PersonPicker } from "@/components/workspace/common";
+import { faDate, setDisplayPreferences } from "@/lib/calendar";
 import { Avatar, Busy, Empty, ErrorBox } from "@/components/workspace/common";
 import { Graph } from "@/components/workspace/graph";
 import { CalendarView } from "@/components/workspace/calendar";
@@ -264,6 +267,10 @@ export default function Page() {
     [peopleCursor, setPeopleCursor] = useState<string | null>(null),
     [peopleLoading, setPeopleLoading] = useState(false),
     [archived, setArchived] = useState(false);
+  const [actionPerson, setActionPerson] = useState(""),
+    [dueFrom, setDueFrom] = useState(""),
+    [dueTo, setDueTo] = useState(""),
+    [timelineType, setTimelineType] = useState("");
   const [taskFilter, setTaskFilter] = useState("pending"),
     [tasks, setTasks] = useState<Action[]>([]),
     [taskCursor, setTaskCursor] = useState<string | null>(null),
@@ -276,10 +283,24 @@ export default function Page() {
     [error, setError] = useState<Error | null>(null),
     [busyAction, setBusyAction] = useState<string | null>(null);
   const changed = () => setRevision((v) => v + 1);
+  useEffect(() => {
+    const logout = () => {
+      setUser(null);
+      setSelectedId(null);
+      setDashboard(null);
+      setPeople([]);
+      setTasks([]);
+      setNotifications([]);
+    };
+    window.addEventListener("relationship:unauthenticated", logout);
+    return () =>
+      window.removeEventListener("relationship:unauthenticated", logout);
+  }, []);
   const loadUser = useCallback(async () => {
     try {
       const u = await api<User>("auth/me");
       setCsrf(u.csrf_token);
+      setDisplayPreferences(u.timezone, u.ui_calendar ?? "jalali");
       setUser(u);
     } catch (e) {
       if ((e as APIError).code === "UNAUTHENTICATED") {
@@ -292,12 +313,12 @@ export default function Page() {
     loadUser();
   }, [loadUser]);
   useEffect(() => {
-    if (!user) return;
+    if (!user || user.must_change_password) return;
     let alive = true;
     Promise.all([
       api("dashboard?days=" + days),
       api("notifications"),
-      api("tags"),
+      apiAll("tags"),
     ])
       .then(([d, n, t]) => {
         if (alive) {
@@ -313,7 +334,7 @@ export default function Page() {
     };
   }, [user?.id, revision, days]);
   useEffect(() => {
-    if (!user || view !== "people") return;
+    if (!user || user.must_change_password || view !== "people") return;
     let alive = true;
     setPeopleLoading(true);
     const timer = setTimeout(() => {
@@ -343,11 +364,30 @@ export default function Page() {
     };
   }, [user?.id, view, query, importance, tag, archived, revision]);
   useEffect(() => {
-    if (!user || view !== "actions") return;
+    if (!user || user.must_change_password || view !== "actions") return;
     let alive = true;
     api(
       "actions?limit=30" +
-        (taskFilter === "all" ? "" : "&status=" + taskFilter),
+        (taskFilter === "all" ? "" : "&status=" + taskFilter) +
+        (actionPerson ? "&person_id=" + actionPerson : "") +
+        (dueFrom
+          ? "&due_from=" +
+            encodeURIComponent(
+              DateTime.fromISO(dueFrom, { zone: user.timezone })
+                .startOf("day")
+                .toUTC()
+                .toISO()!,
+            )
+          : "") +
+        (dueTo
+          ? "&due_to=" +
+            encodeURIComponent(
+              DateTime.fromISO(dueTo, { zone: user.timezone })
+                .endOf("day")
+                .toUTC()
+                .toISO()!,
+            )
+          : ""),
     )
       .then((d) => {
         if (alive) {
@@ -359,7 +399,7 @@ export default function Page() {
     return () => {
       alive = false;
     };
-  }, [user?.id, view, taskFilter, revision]);
+  }, [user?.id, view, taskFilter, revision, actionPerson, dueFrom, dueTo]);
   useEffect(() => {
     if (!selectedId || !user) {
       setProfile(null);
@@ -369,11 +409,16 @@ export default function Page() {
     setProfile(null);
     Promise.all([
       api("people/" + selectedId),
-      api("people/" + selectedId + "/relationships"),
+      apiAll("people/" + selectedId + "/relationships"),
       api("people/" + selectedId + "/introduction-path"),
-      api("important-dates?person_id=" + selectedId),
-      api("actions?limit=100&person_id=" + selectedId),
-      api("people/" + selectedId + "/timeline"),
+      apiAll("important-dates?person_id=" + selectedId),
+      apiAll("actions?person_id=" + selectedId),
+      api(
+        "people/" +
+          selectedId +
+          "/timeline" +
+          (timelineType ? "?type=" + timelineType : ""),
+      ),
     ])
       .then(([p, r, path, d, a, t]) => {
         if (alive)
@@ -391,9 +436,9 @@ export default function Page() {
     return () => {
       alive = false;
     };
-  }, [selectedId, user?.id, revision]);
+  }, [selectedId, user?.id, revision, timelineType]);
   const go = (v: string) => {
-    window.scrollTo({top:0});
+    window.scrollTo({ top: 0 });
     setView(v);
     setError(null);
     setQuery("");
@@ -402,6 +447,7 @@ export default function Page() {
   const openPerson = (id: string) => {
     setSelectedId(id);
     setProfileTab("overview");
+    setTimelineType("");
   };
   const flower = async (id: string, event?: any) => {
     try {
@@ -544,25 +590,21 @@ export default function Page() {
         const fresh =
           workflow.type === "person"
             ? { person: await api("people/" + workflow.person?.id) }
-            : workflow.type === "action" || workflow.type === "flower"
-              ? { record: await api("actions/" + workflow.record.id) }
-              : workflow.type === "florist"
-                ? {
-                    record: (await api("florists")).items.find(
-                      (r: any) => r.id === workflow.record.id,
-                    ),
-                  }
-                : workflow.type === "relationship"
-                  ? {
-                      record: (await api("relationships")).items.find(
-                        (r: any) => r.id === workflow.record.id,
-                      ),
-                    }
-                  : {
-                      record: (await api("important-dates")).items.find(
-                        (r: any) => r.id === workflow.record.id,
-                      ),
-                    };
+            : {
+                record: await api(
+                  (workflow.type === "action" || workflow.type === "flower"
+                    ? "actions"
+                    : workflow.type === "florist"
+                      ? "florists"
+                      : workflow.type === "reminder"
+                        ? "reminders"
+                        : workflow.type === "relationship"
+                          ? "relationships"
+                          : "important-dates") +
+                    "/" +
+                    workflow.record.id,
+                ),
+              };
         setWorkflow({ ...workflow, ...fresh });
       } catch (e) {
         toast.error((e as Error).message);
@@ -578,6 +620,8 @@ export default function Page() {
     setWorkflow(null);
     changed();
     toast.success("اطلاعات ذخیره شد.");
+    if (result?.warning) toast.warning(result.warning);
+    for (const warning of result?.warnings ?? []) toast.warning(warning);
     if (type === "password") {
       setUser(null);
       setSelectedId(null);
@@ -605,6 +649,24 @@ export default function Page() {
       <>
         <Login onLogin={loadUser} />
         <Toaster position="bottom-left" dir="rtl" richColors />
+      </>
+    );
+  if (user.must_change_password)
+    return (
+      <>
+        <main className="force-password">
+          <p>پیش از ورود به فضای روابط، رمز اولیه را تغییر دهید.</p>
+        </main>
+        <WorkflowModal
+          workflow={{ type: "password" }}
+          user={user}
+          onClose={() => {}}
+          onSaved={() => {
+            setUser(null);
+            toast.success("رمز تغییر کرد؛ دوباره وارد شوید.");
+          }}
+        />
+        <Toaster position="bottom-left" dir="rtl" />
       </>
     );
   const heading = (
@@ -1164,6 +1226,8 @@ export default function Page() {
                 </button>,
               )}
               <CalendarView
+                key={user.ui_calendar}
+                calendar={user.ui_calendar ?? "jalali"}
                 zone={user.timezone}
                 onPerson={openPerson}
                 onFlower={flower}
@@ -1185,6 +1249,38 @@ export default function Page() {
                   اقدام جدید
                 </button>,
               )}
+              <div className="filter-row">
+                <PersonPicker
+                  required={false}
+                  label="فرد"
+                  value={actionPerson}
+                  onChange={setActionPerson}
+                />
+                <DateField
+                  label="از تاریخ"
+                  name="due_from_filter"
+                  defaultValue={dueFrom}
+                  calendar={user.ui_calendar}
+                  onChange={setDueFrom}
+                />
+                <DateField
+                  label="تا تاریخ"
+                  name="due_to_filter"
+                  defaultValue={dueTo}
+                  calendar={user.ui_calendar}
+                  onChange={setDueTo}
+                />
+                <button
+                  className="text-button"
+                  onClick={() => {
+                    setActionPerson("");
+                    setDueFrom("");
+                    setDueTo("");
+                  }}
+                >
+                  پاک کردن فیلترها
+                </button>
+              </div>
               <Tabs dir="rtl" value={taskFilter} onValueChange={setTaskFilter}>
                 <TabsList className="app-tabs">
                   {["pending", "done", "cancelled", "all"].map((t) => (
@@ -1215,7 +1311,32 @@ export default function Page() {
                               taskCursor +
                               (taskFilter === "all"
                                 ? ""
-                                : "&status=" + taskFilter),
+                                : "&status=" + taskFilter) +
+                              (actionPerson
+                                ? "&person_id=" + actionPerson
+                                : "") +
+                              (dueFrom
+                                ? "&due_from=" +
+                                  encodeURIComponent(
+                                    DateTime.fromISO(dueFrom, {
+                                      zone: user.timezone,
+                                    })
+                                      .startOf("day")
+                                      .toUTC()
+                                      .toISO()!,
+                                  )
+                                : "") +
+                              (dueTo
+                                ? "&due_to=" +
+                                  encodeURIComponent(
+                                    DateTime.fromISO(dueTo, {
+                                      zone: user.timezone,
+                                    })
+                                      .endOf("day")
+                                      .toUTC()
+                                      .toISO()!,
+                                  )
+                                : ""),
                           );
                           setTasks((v) => [...v, ...d.items]);
                           setTaskCursor(d.next_cursor);
@@ -1585,6 +1706,12 @@ export default function Page() {
                             aria-label={"حذف " + d.title}
                             onClick={async () => {
                               try {
+                                if (
+                                  !window.confirm(
+                                    "این مناسبت بایگانی می‌شود و همه اقدامات باز و یادآوری‌های وابسته آن لغو می‌شوند. ادامه می‌دهید؟",
+                                  )
+                                )
+                                  return;
                                 await api("important-dates/" + d.id, "DELETE");
                                 changed();
                               } catch (e) {
@@ -1622,6 +1749,28 @@ export default function Page() {
                     </div>
                   </TabsContent>
                   <TabsContent value="timeline">
+                    <label>
+                      نوع تعامل
+                      <select
+                        value={timelineType}
+                        onChange={(e) => setTimelineType(e.target.value)}
+                      >
+                        <option value="">همه</option>
+                        {[
+                          "call",
+                          "message",
+                          "sms",
+                          "meeting",
+                          "gift",
+                          "flower",
+                          "note",
+                        ].map((t) => (
+                          <option key={t} value={t}>
+                            {labels[t] ?? t}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
                     <div className="timeline">
                       {profile.timeline.length ? (
                         profile.timeline.map((i: any) => (
@@ -1657,7 +1806,8 @@ export default function Page() {
                                 "people/" +
                                   p.id +
                                   "/timeline?cursor=" +
-                                  profile.timeline_cursor,
+                                  profile.timeline_cursor +
+                                  (timelineType ? "&type=" + timelineType : ""),
                               );
                               setProfile((prev: any) => ({
                                 ...prev,

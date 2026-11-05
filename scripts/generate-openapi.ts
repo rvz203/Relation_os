@@ -60,7 +60,16 @@ function add(
 add("/auth/login", ["post"], "Sign in with owner credentials");
 paths["/auth/login"].post.security = [];
 add("/auth/logout", ["post"], "Revoke the current session");
-add("/auth/me", ["get"], "Current owner and CSRF token");
+add(
+  "/auth/me",
+  ["get"],
+  "Current owner and CSRF token; must_change_password gates all private features",
+);
+add(
+  "/operations",
+  ["get"],
+  "Queue age, worker heartbeat, SMS state/credit and API error counts",
+);
 add("/auth/password", ["post"], "Change password and revoke all sessions");
 add(
   "/settings",
@@ -70,7 +79,7 @@ add(
 add(
   "/people",
   ["get"],
-  "Search and cursor pagination: q, importance, tag, active, cursor, limit",
+  "Search and cursor pagination: q, importance, tag_id, active, cursor, limit",
 );
 add("/people", ["post"], "Create a person; Idempotency-Key required", "Person");
 add("/people/{id}", ["get"], "Person detail");
@@ -102,6 +111,7 @@ add(
   "Edit an edge with version",
   "Relationship",
 );
+add("/relationships/{id}", ["get"], "Read an owned edge");
 add("/relationships/{id}", ["delete"], "Archive an edge");
 add(
   "/network",
@@ -110,6 +120,7 @@ add(
 );
 add("/important-dates", ["get"], "Active occasions, optionally by person_id");
 add("/important-dates", ["post"], "Create an occasion", "ImportantDate");
+add("/important-dates/{id}", ["get"], "Read an owned occasion");
 add(
   "/important-dates/{id}",
   ["patch"],
@@ -153,8 +164,10 @@ add(
   ["get", "post"],
   "List or create once/per-occurrence reminders",
 );
+add("/reminders/{id}", ["get"], "Read an owned reminder");
 add("/reminders/{id}", ["patch", "delete"], "Edit or disable a reminder");
 add("/florists", ["get", "post"], "List or create florists");
+add("/florists/{id}", ["get"], "Read an owned florist");
 add("/florists/{id}", ["patch"], "Edit or deactivate with version");
 add("/notifications", ["get"], "Recent notifications");
 add("/notifications/{id}/read", ["post"], "Mark read");
@@ -170,16 +183,20 @@ add("/imports/template", ["get"], "Download UTF-8 CSV template");
 add(
   "/imports/people",
   ["post"],
-  "Stage multipart CSV/XLSX file <=5MB/5000 rows",
+  "Stage multipart CSV/XLSX file <=5MB/5000 rows; allow_duplicate=true is explicit reimport",
 );
 add("/imports/{id}", ["get"], "Import preview and row decisions");
 add(
   "/imports/{id}/mapping",
   ["patch"],
-  "Update mapping and explicit row decisions",
+  "Update mapping, external_references UUID mapping and explicit row decisions; frozen after commit request",
 );
 add("/imports/{id}/validate", ["post"], "Revalidate staging");
-add("/imports/{id}/commit", ["post"], "Atomic idempotent commit with checksum");
+add(
+  "/imports/{id}/commit",
+  ["post"],
+  "Queue an atomic idempotent commit with checksum; returns 202, poll job status",
+);
 add("/imports/{id}/errors", ["get"], "Download safe CSV error report");
 add(
   "/sms/webhooks/http",

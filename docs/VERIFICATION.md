@@ -1,12 +1,12 @@
 # Verification
 
-Executed against local PostgreSQL 14 with fictional records and sandbox SMS on 4 November 2026.
+Updated on 5 November 2026. Executed against local PostgreSQL 14 with fictional records and sandbox SMS. See [the specification review](SPECIFICATION_REVIEW.md) for the full AC01–AC15 and T01–T09 matrix.
 
 ## Automated checks
 
 - TypeScript checking and a Next.js production build.
-- Six domain tests: Jalali annual recurrence, both leap policies, Gregorian leap-day behavior, inclusive today, Tehran florist scheduling, Persian normalization, encryption integrity and password verification.
-- Eighteen API/database integration checks: unauthenticated access, CSRF, idempotent creates, cross-owner people access, normalized search, introduction cycles, optimistic versions, symmetric edges, today's occasion, concurrent completion, flower validation/preview/sandbox acceptance, unknown-send blocking, duplicate reminder execution, two-pass CSV import, duplicate decisions, rollback, XLSX/formula validation, archive cancellation and session revocation. Some checks exercise several related assertions.
+- Seven domain tests (including DST gaps and ambiguous times): Jalali annual recurrence, both leap policies, Gregorian leap-day behavior, inclusive today, Tehran florist scheduling, Persian normalization, encryption integrity and password verification.
+- Twenty-nine API/database integration checks: unauthenticated access, CSRF, idempotent creates, cross-owner people access, normalized search, introduction cycles, optimistic versions, symmetric edges, today's occasion, concurrent completion, flower validation/preview/sandbox acceptance, unknown-send blocking, duplicate reminder execution, two-pass CSV import, duplicate decisions, rollback, XLSX/formula validation, archive cancellation and session revocation. Additional scenarios cover complete profile fields, required edit versions, bounded graph flags, action reminders, owner-only in-app recipients, grace periods, attempt snapshots, signed receipts, expired leases, frozen asynchronous imports, existing-network cycles, future timezone changes, monitoring, initial passwords, late rollback, reservation/edit races, retry exhaustion and validated private photos. Some checks exercise several related assertions.
 
 The integration runner creates temporary owners and removes their data after the run. SMS tests call only the sandbox adapter. Accepted and delivered remain distinct.
 
@@ -22,7 +22,7 @@ The optimized production server passed health, login, dashboard and logout smoke
 
 - Owner UAT against the full Persian specification and real import samples.
 - Selected provider sandbox tests for receipts, request timeouts, lost responses, status reconciliation and account balance.
-- Measured 10,000-person / 50,000-edge performance at ten concurrent sessions; no p95 claim is made.
+- Repeat the locally passing 10,000-person / 50,000-edge, ten-session benchmark on production-equivalent infrastructure. Local list/search p95: 13–18 ms; graph: 65 ms. See `performance-local.json`.
 - Production mobile devices, assistive technology, infrastructure encryption, monitoring destinations and backup rotation.
 - Confirmation of currency, send time, leap-day and retention policies.
 - Production deployment, provider credentials and geographic/network accessibility.

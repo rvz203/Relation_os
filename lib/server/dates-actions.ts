@@ -13,6 +13,7 @@ import {
   hash,
   text,
   uuid,
+  isoDay,
 } from "./core";
 import {
   occurrences,
@@ -22,13 +23,22 @@ import {
   flowerSchedule,
 } from "@/lib/calendar";
 import type { Owner } from "./auth";
+import { saveReminder } from "./settings";
 
 export async function saveDate(user: string, input: unknown, id?: string) {
   return transaction(async (db) => {
     await lockOwner(db, user);
     const current = id ? await owned(db, "important_dates", user, id) : null;
-    const d = dateSchema.parse({ ...current, ...(input as object) });
-    if (current) checkVersion(current as { version: number }, d.version);
+    const d = dateSchema.parse({
+      ...current,
+      notes: decrypt(current?.notes),
+      ...(input as object),
+    });
+    if (current)
+      checkVersion(
+        current as { version: number },
+        (input as { version?: number })?.version,
+      );
     await owned(db, "people", user, d.person_id, true);
     if (!isValidOriginal(d))
       fail("روز واردشده در تقویم انتخاب‌شده معتبر نیست.");
@@ -57,6 +67,10 @@ export async function saveDate(user: string, input: unknown, id?: string) {
           [user, ...vals],
           db,
         );
+    await db.query(
+      "UPDATE important_dates SET notes=$3 WHERE user_id=$1 AND id=$2",
+      [user, r.id, encrypt(d.notes)],
+    );
     if (id) {
       await db.query(
         "UPDATE reminders SET version=version+1 WHERE user_id=$1 AND important_date_id=$2",
@@ -68,17 +82,19 @@ export async function saveDate(user: string, input: unknown, id?: string) {
       );
     }
     await audit(db, user, id ? "update" : "create", "important_date", r.id);
-    return r;
+    return { ...r, notes: d.notes ?? "" };
   });
 }
 export async function calendar(user: Owner, from: string, to: string) {
+  isoDay.parse(from);
+  isoDay.parse(to);
   const start = DateTime.fromISO(from),
     end = DateTime.fromISO(to);
   if (
     !start.isValid ||
     !end.isValid ||
     end < start ||
-    end.diff(start, "days").days > 366
+    end.diff(start, "days").days > 365
   )
     fail("بازه تقویم باید معتبر و حداکثر ۳۶۶ روز باشد.");
   const dates = await query(
@@ -88,6 +104,7 @@ export async function calendar(user: Owner, from: string, to: string) {
   const events = dates.flatMap((d) =>
     occurrences(d as any, from, to).map((date) => ({
       ...d,
+      notes: decrypt(d.notes),
       occurrence_date: date,
       event_type: "occasion",
     })),
@@ -101,6 +118,7 @@ export async function calendar(user: Owner, from: string, to: string) {
       ...events,
       ...actions.map((a) => ({
         ...a,
+        notes: decrypt(a.notes),
         occurrence_date: DateTime.fromJSDate(a.due_at)
           .setZone(user.timezone)
           .toISODate(),
@@ -114,13 +132,14 @@ export async function calendar(user: Owner, from: string, to: string) {
 export function publicAction(a: Record<string, any>) {
   if (a.delivery_address) a.delivery_address = decrypt(a.delivery_address);
   if (a.card_message) a.card_message = decrypt(a.card_message);
-  if (a.notes) a.notes = decrypt(a.notes);
+  a.notes = decrypt(a.notes);
+  a.flower_notes = decrypt(a.flower_notes);
   return a;
 }
 export async function actionDetail(user: string, id: string, db: DB = pool) {
   await owned(db, "actions", user, id);
   const [a] = await query(
-    `SELECT a.*,p.display_name person_name,f.florist_id,f.budget_amount,f.currency,f.delivery_date,f.delivery_address,f.card_message,f.sms_accepted_at,o.state sms_state,o.scheduled_at calculated_sms_at,o.error_code FROM actions a JOIN people p ON p.user_id=a.user_id AND p.id=a.person_id LEFT JOIN flower_details f ON f.action_id=a.id AND f.user_id=a.user_id LEFT JOIN outbox_messages o ON o.user_id=a.user_id AND o.dedupe_key='flower:'||a.id||':initial_sms' WHERE a.user_id=$1 AND a.id=$2`,
+    `SELECT a.*,p.display_name person_name,f.florist_id,f.budget_amount,f.currency,f.delivery_date,f.delivery_address,f.card_message,f.delivery_local_time,f.timezone flower_timezone,f.notes flower_notes,f.sms_accepted_at,o.state sms_state,o.scheduled_at calculated_sms_at,o.error_code FROM actions a JOIN people p ON p.user_id=a.user_id AND p.id=a.person_id LEFT JOIN flower_details f ON f.action_id=a.id AND f.user_id=a.user_id LEFT JOIN outbox_messages o ON o.user_id=a.user_id AND o.dedupe_key='flower:'||a.id||':initial_sms' WHERE a.user_id=$1 AND a.id=$2`,
     [user, id],
     db,
   );
@@ -144,6 +163,8 @@ export async function saveAction(
             delivery_date: current.delivery_date,
             delivery_address: current.delivery_address,
             card_message: current.card_message,
+            delivery_local_time: current.delivery_local_time,
+            notes: current.flower_notes,
           }
         : undefined;
     const d = actionSchema.parse({
@@ -157,12 +178,16 @@ export async function saveAction(
       ...(input as object),
     });
     if (current) {
-      checkVersion(current as { version: number }, d.version);
+      checkVersion(
+        current as { version: number },
+        (input as { version?: number })?.version,
+      );
       if (current.status !== "pending")
         fail("اقدام بسته‌شده قابل ویرایش نیست.", 409);
       if (current.action_type !== d.action_type)
         fail("نوع اقدام موجود تغییر نمی‌کند.");
       if (
+        current.sms_accepted_at ||
         ["processing", "accepted", "delivered", "unknown"].includes(
           current.sms_state,
         )
@@ -173,7 +198,7 @@ export async function saveAction(
           "SEND_STARTED",
         );
     }
-    await owned(db, "people", user.id, d.person_id, true);
+    const person = await owned(db, "people", user.id, d.person_id, true);
     if (d.important_date_id) {
       const date = await owned(
         db,
@@ -205,7 +230,19 @@ export async function saveAction(
       d.important_date_id ?? null,
       d.occurrence_date ?? null,
       d.action_type,
-      d.title,
+      d.title ??
+        d.custom_title ??
+        {
+          call: "تماس",
+          message: "پیام",
+          meeting: "جلسه",
+          gift: "هدیه",
+          flower: "ارسال گل",
+          reminder: "یادآوری",
+          custom: "اقدام",
+        }[d.action_type] +
+          " · " +
+          person.display_name,
       d.due_at,
       encrypt(d.notes),
     ];
@@ -235,6 +272,16 @@ export async function saveAction(
           encrypt(f.card_message) ?? "",
         ],
       );
+      await db.query(
+        "UPDATE flower_details SET delivery_local_time=$3,timezone=$4,notes=$5 WHERE user_id=$1 AND action_id=$2",
+        [
+          user.id,
+          a.id,
+          f.delivery_local_time ?? null,
+          user.timezone,
+          encrypt(f.notes),
+        ],
+      );
       const s = flowerSchedule(
         f.delivery_date,
         user.florist_send_local_time,
@@ -242,7 +289,7 @@ export async function saveAction(
       );
       const late = f.delivery_date <= localToday(user.timezone);
       await db.query(
-        `INSERT INTO outbox_messages(user_id,dedupe_key,action_id,channel,schedule_version,scheduled_at,deadline_at,state,error_code) VALUES($1,$2,$3,'sms',$4,$5,$6,$7,$8) ON CONFLICT(user_id,dedupe_key) DO UPDATE SET schedule_version=$4,scheduled_at=$5,deadline_at=$6,state=$7,error_code=$8,updated_at=now() WHERE outbox_messages.state IN('queued','retry_wait','cancelled','expired','failed')`,
+        `INSERT INTO outbox_messages(user_id,dedupe_key,action_id,channel,schedule_version,scheduled_at,deadline_at,state,error_code) VALUES($1,$2,$3,'sms',$4,$5,$6,$7,$8) ON CONFLICT(user_id,dedupe_key) DO UPDATE SET schedule_version=$4,scheduled_at=$5,deadline_at=$6,state=$7,error_code=$8,preview_fingerprint=NULL,payload_snapshot=NULL,next_attempt_at=NULL,updated_at=now() WHERE outbox_messages.state IN('queued','retry_wait','cancelled','expired','failed')`,
         [
           user.id,
           `flower:${a.id}:initial_sms`,
@@ -255,6 +302,18 @@ export async function saveAction(
         ],
       );
     }
+    if (d.reminder_at)
+      await saveReminder(
+        user,
+        {
+          action_id: a.id,
+          channel: "in_app",
+          message: a.title,
+          scheduled_at: d.reminder_at,
+        },
+        undefined,
+        db,
+      );
     await audit(db, user.id, id ? "update" : "create", "action", a.id);
     return actionDetail(user.id, a.id, db);
   };
@@ -323,6 +382,7 @@ export async function addInteraction(user: string, input: unknown) {
         "call",
         "meeting",
         "message",
+        "sms",
         "gift",
         "flower",
         "note",
@@ -330,6 +390,8 @@ export async function addInteraction(user: string, input: unknown) {
       ]),
       notes: text.min(1),
       occurred_at: z.string().datetime({ offset: true }),
+      direction: z.enum(["incoming", "outgoing"]).nullish(),
+      related_message_id: uuid.nullish(),
     })
     .parse(input);
   if (DateTime.fromISO(d.occurred_at) > DateTime.now().plus({ minutes: 1 }))
@@ -348,7 +410,13 @@ export async function addInteraction(user: string, input: unknown) {
       ],
       db,
     );
-    return { ...r, notes: d.notes };
+    if (d.related_message_id)
+      await owned(db, "outbox_messages", user, d.related_message_id);
+    await db.query(
+      "UPDATE interactions SET direction=$3,related_message_id=$4 WHERE user_id=$1 AND id=$2",
+      [user, r.id, d.direction ?? null, d.related_message_id ?? null],
+    );
+    return { ...r, notes: d.notes, direction: d.direction ?? null };
   });
 }
 export async function idempotent(
@@ -374,12 +442,20 @@ export async function idempotent(
           409,
           "IDEMPOTENCY_CONFLICT",
         );
-      return cached.response_body.ciphertext?JSON.parse(decrypt(cached.response_body.ciphertext)):cached.response_body;
+      return cached.response_body.ciphertext
+        ? JSON.parse(decrypt(cached.response_body.ciphertext))
+        : cached.response_body;
     }
     const result = await work(db);
     await db.query(
       "INSERT INTO idempotency_requests(user_id,route,idempotency_key,request_hash,response_body,response_code) VALUES($1,$2,$3,$4,$5,201)",
-      [user, route, key, fingerprint, JSON.stringify({ciphertext:encrypt(JSON.stringify(result))})],
+      [
+        user,
+        route,
+        key,
+        fingerprint,
+        JSON.stringify({ ciphertext: encrypt(JSON.stringify(result)) }),
+      ],
     );
     return result;
   });

@@ -7,6 +7,7 @@ import {
   occurrences,
   nextOccurrence,
   isValidOriginal,
+  zonedInstant,
   type ImportantDate,
 } from "../lib/calendar";
 import {
@@ -66,6 +67,20 @@ test("florist sends at 09:00 Tehran on the previous calendar day", () => {
   assert.equal(
     DateTime.fromISO(schedule.deadline_at).setZone("Asia/Tehran").toISODate(),
     "2026-11-04",
+  );
+});
+test("DST gaps advance to the first valid minute and repeated hours use the first instant", () => {
+  assert.equal(
+    zonedInstant("2026-03-08", "02:30", "America/New_York"),
+    "2026-03-08T07:00:00.000Z",
+  );
+  assert.equal(
+    zonedInstant("2026-11-01", "01:30", "America/New_York"),
+    "2026-11-01T05:30:00.000Z",
+  );
+  assert.equal(
+    zonedInstant("2011-12-30", "09:00", "Pacific/Apia"),
+    "2011-12-30T10:00:00.000Z",
   );
 });
 test("normalizes Persian search and phone digits without altering display text", () => {

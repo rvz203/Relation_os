@@ -17,7 +17,10 @@
     "test": "tsx --env-file-if-exists=.env --test tests/*.test.ts",
     "test:integration": "tsx --env-file-if-exists=.env tests/integration.ts",
     "api:generate": "tsx --env-file-if-exists=.env scripts/generate-openapi.ts",
-    "maintenance": "tsx --env-file-if-exists=.env scripts/maintenance.ts"
+    "maintenance": "tsx --env-file-if-exists=.env scripts/maintenance.ts",
+    "monitor": "tsx --env-file-if-exists=.env scripts/monitor.ts",
+    "test:performance": "tsx --env-file-if-exists=.env scripts/benchmark.ts",
+    "test:recovery": "tsx --env-file-if-exists=.env scripts/test-recovery.ts"
   },
   "dependencies": {
     "@base-ui/react": "^1.7.0",

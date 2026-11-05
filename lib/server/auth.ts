@@ -1,5 +1,6 @@
 import { randomBytes } from "node:crypto";
 import { NextRequest, NextResponse } from "next/server";
+import { jsonBody } from "./http";
 import { query, transaction } from "@/db";
 import {
   AppError,
@@ -17,6 +18,8 @@ export type Owner = {
   florist_send_local_time: string;
   sms_enabled: boolean;
   csrf_token: string;
+  ui_calendar?: "jalali" | "gregorian";
+  must_change_password?: boolean;
 };
 export const COOKIE = "relationship_session";
 export function checkOrigin(req: NextRequest) {
@@ -33,7 +36,7 @@ export async function owner(
   if (!token)
     throw new AppError(401, "UNAUTHENTICATED", "ابتدا وارد حساب شوید.");
   const [u] = await query(
-    `SELECT u.id,u.email,u.display_name,u.timezone,u.florist_send_local_time,u.sms_enabled,s.csrf_token FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token_hash=$1 AND s.expires_at>now()`,
+    `SELECT u.id,u.email,u.display_name,u.timezone,u.florist_send_local_time,u.sms_enabled,u.ui_calendar,u.must_change_password,s.csrf_token FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token_hash=$1 AND s.expires_at>now()`,
     [hash(token)],
   );
   if (!u)
@@ -52,7 +55,7 @@ export async function owner(
 const dummy = passwordHash("dummy-constant-verification-value");
 export async function login(req: NextRequest) {
   checkOrigin(req);
-  const data = await req.json();
+  const data = await jsonBody(req);
   const email = String(data.email ?? "")
       .trim()
       .toLowerCase(),

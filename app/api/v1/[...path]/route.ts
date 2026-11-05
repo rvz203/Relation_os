@@ -9,6 +9,7 @@ import { query, transaction, lockOwner, pool } from "@/db";
 import { owner, login, COOKIE } from "@/lib/server/auth";
 import {
   AppError,
+  auditContext,
   fail,
   owned,
   decrypt,
@@ -47,15 +48,23 @@ import {
   getImport,
   updateImport,
   commitImport,
+  requestImportCommit,
   safeCSV,
 } from "@/lib/server/imports";
+import {
+  boundedBody,
+  jsonBody,
+  formBody,
+  pageQuery,
+  pageArray,
+} from "@/lib/server/http";
 import { localToday } from "@/lib/calendar";
+import { healthReport } from "@/lib/server/monitoring";
 import { receiveSMSWebhook } from "@/lib/server/webhook";
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 type Context = { params: Promise<{ path: string[] }> };
-async function handle(req: NextRequest, ctx: Context) {
-  const requestId = randomUUID();
+async function execute(req: NextRequest, ctx: Context, requestId: string) {
   const json = (value: unknown, status = 200) =>
     NextResponse.json(value, {
       status,
@@ -73,7 +82,7 @@ async function handle(req: NextRequest, ctx: Context) {
     if (route === "sms/webhooks/http" && method === "POST")
       return json(
         await receiveSMSWebhook(
-          await req.text(),
+          (await boundedBody(req, 65536)).toString(),
           req.headers.get("x-sms-timestamp"),
           req.headers.get("x-sms-signature"),
         ),
@@ -81,13 +90,12 @@ async function handle(req: NextRequest, ctx: Context) {
     const user = await owner(req, mutation),
       uid = user.id,
       id = parts[1];
-    const body = async () => {
-      try {
-        return await req.json();
-      } catch {
-        fail("بدنه JSON معتبر نیست.", 400, "INVALID_JSON");
-      }
-    };
+    const body = () => jsonBody(req);
+    if (
+      user.must_change_password &&
+      !["auth/me", "auth/password", "auth/logout"].includes(route)
+    )
+      fail("ابتدا رمز اولیه را تغییر دهید.", 403, "PASSWORD_CHANGE_REQUIRED");
     if (route === "auth/me" && method === "GET")
       return json({ ...user, sms_mode: process.env.SMS_MODE ?? "sandbox" });
     if (route === "auth/logout" && method === "POST") {
@@ -99,8 +107,9 @@ async function handle(req: NextRequest, ctx: Context) {
       return res;
     }
     if (route === "auth/password" && method === "POST") {
-      const { passwordHash, verifyPassword } =
-        await import("@/lib/server/core");
+      const { passwordHash, verifyPassword } = await import(
+        "@/lib/server/core"
+      );
       const d = z
         .object({
           current_password: z.string(),
@@ -113,15 +122,25 @@ async function handle(req: NextRequest, ctx: Context) {
       if (!verifyPassword(d.current_password, u.password_hash))
         fail("رمز فعلی درست نیست.");
       await transaction(async (db) => {
-        await db.query("UPDATE users SET password_hash=$2 WHERE id=$1", [
-          uid,
-          passwordHash(d.new_password),
-        ]);
+        await lockOwner(db, uid);
+        const [latest] = await query(
+          "SELECT password_hash FROM users WHERE id=$1",
+          [uid],
+          db,
+        );
+        if (!verifyPassword(d.current_password, latest.password_hash))
+          fail("رمز فعلی تغییر کرده است.");
+        await db.query(
+          "UPDATE users SET password_hash=$2,must_change_password=false WHERE id=$1",
+          [uid, passwordHash(d.new_password)],
+        );
         await db.query("DELETE FROM sessions WHERE user_id=$1", [uid]);
         await audit(db, uid, "password_changed", "user", uid);
       });
       return json({ ok: true });
     }
+    if (route === "operations" && method === "GET")
+      return json(await healthReport(uid));
     if (route === "settings") {
       if (method === "GET") {
         const [self] = await query(
@@ -163,7 +182,7 @@ async function handle(req: NextRequest, ctx: Context) {
         return json(await archivePerson(uid, id));
       if (parts[2] === "relationships" && method === "GET") {
         await owned(pool, "people", uid, id);
-        return json({ items: await relationships(uid, id) });
+        return json(pageArray(await relationships(uid, id), params));
       }
       if (parts[2] === "introduction-path" && method === "GET") {
         await owned(pool, "people", uid, id);
@@ -171,7 +190,10 @@ async function handle(req: NextRequest, ctx: Context) {
       }
       if (parts[2] === "timeline" && method === "GET") {
         await owned(pool, "people", uid, id);
-        const limit = Math.min(100, Number(params.get("limit")) || 30);
+        const limit = Math.min(
+          100,
+          Math.max(1, Math.floor(Number(params.get("limit")) || 30)),
+        );
         const rows = await query(
           "SELECT * FROM interactions WHERE user_id=$1 AND person_id=$2 AND ($3::uuid IS NULL OR (occurred_at,id)<(SELECT occurred_at,id FROM interactions WHERE user_id=$1 AND person_id=$2 AND id=$3)) AND ($4::text IS NULL OR interaction_type=$4) ORDER BY occurred_at DESC,id DESC LIMIT $5",
           [uid, id, params.get("cursor"), params.get("type"), limit + 1],
@@ -208,13 +230,18 @@ async function handle(req: NextRequest, ctx: Context) {
           );
         }
         if (method === "POST") {
-          const file = (await req.formData()).get("file");
+          const file = (await formBody(req)).get("file");
           if (!(file instanceof File) || file.size > 5 * 1024 * 1024)
             fail("تصویر باید حداکثر ۵ مگابایت باشد.");
           const image = sharp(Buffer.from(await file.arrayBuffer()), {
             limitInputPixels: 25000000,
           });
-          const meta = await image.metadata();
+          let meta;
+          try {
+            meta = await image.metadata();
+          } catch {
+            fail("محتوای فایل تصویر معتبر نیست.");
+          }
           if (!["jpeg", "png", "webp"].includes(meta.format ?? ""))
             fail("فقط JPEG، PNG یا WebP پذیرفته می‌شود.");
           const buffer = await image
@@ -236,9 +263,14 @@ async function handle(req: NextRequest, ctx: Context) {
     if (route === "network" && method === "GET")
       return json(await network(uid, params));
     if (parts[0] === "relationships") {
+      if (method === "GET" && id)
+        return json(await owned(pool, "relationships", uid, id));
       if (method === "GET")
         return json({
-          items: await relationships(uid, params.get("person_id") ?? undefined),
+          ...pageArray(
+            await relationships(uid, params.get("person_id") ?? undefined),
+            params,
+          ),
         });
       if (method === "POST" && !id)
         return json(await saveRelationship(uid, await body()), 201);
@@ -256,43 +288,67 @@ async function handle(req: NextRequest, ctx: Context) {
     if (parts[0] === "tags" || parts[0] === "relationship-types") {
       const table = parts[0] === "tags" ? "tags" : "relationship_types";
       if (method === "GET")
-        return json({
-          items: await query(
-            `SELECT * FROM ${table} WHERE user_id=$1 AND is_active ORDER BY ${table === "tags" ? "name" : "label"}`,
-            [uid],
+        return json(
+          await pageQuery(
+            `SELECT * FROM ${table} WHERE user_id=$1 AND ($2::boolean IS NULL OR is_active=$2)`,
+            [
+              uid,
+              params.get("active") === "all"
+                ? null
+                : params.get("active") !== "false",
+            ],
+            params,
           ),
-        });
+        );
       if (table === "tags" && (method === "POST" || method === "PATCH")) {
-        const d = z
-          .object({
-            name: text.min(1).max(80),
-            kind: z.enum(["expertise", "label"]).default("expertise"),
-          })
-          .parse(await body());
-        if (id) await owned(pool, table, uid, id);
-        const [r] = id
-          ? await query(
-              "UPDATE tags SET name=$3,normalized_name=$4,kind=$5 WHERE user_id=$1 AND id=$2 RETURNING *",
-              [uid, id, d.name, normalize(d.name), d.kind],
-            )
-          : await query(
-              "INSERT INTO tags(user_id,name,normalized_name,kind) VALUES($1,$2,$3,$4) RETURNING *",
-              [uid, d.name, normalize(d.name), d.kind],
-            );
+        const input = await body();
+        const r = await transaction(async (db) => {
+          await lockOwner(db, uid);
+          const current = id ? await owned(db, table, uid, id) : null;
+          const d = z
+            .object({
+              name: text.min(1).max(80),
+              kind: z.enum(["expertise", "label"]).default("expertise"),
+              is_active: z.boolean().default(true),
+            })
+            .parse({ ...current, ...input });
+          const [result] = id
+            ? await query(
+                "UPDATE tags SET name=$3,normalized_name=$4,kind=$5,is_active=$6 WHERE user_id=$1 AND id=$2 RETURNING *",
+                [uid, id, d.name, normalize(d.name), d.kind, d.is_active],
+                db,
+              )
+            : await query(
+                "INSERT INTO tags(user_id,name,normalized_name,kind,is_active) VALUES($1,$2,$3,$4,$5) RETURNING *",
+                [uid, d.name, normalize(d.name), d.kind, d.is_active],
+                db,
+              );
+          await audit(
+            db,
+            uid,
+            id ? "update" : "create",
+            "tag",
+            result.id,
+            Object.keys(d),
+          );
+          return result;
+        });
         return json(r, id ? 200 : 201);
       }
       if (
         table === "relationship_types" &&
         (method === "POST" || method === "PATCH")
       ) {
+        const currentType = id ? await owned(pool, table, uid, id) : null;
         const d = z
           .object({
             code: z.string().regex(/^[a-z][a-z_]{1,39}$/),
             label: text.min(1),
             reverse_label: text.optional(),
             is_directed: z.boolean(),
+            is_active: z.boolean().default(true),
           })
-          .parse(await body());
+          .parse({ ...currentType, ...(await body()) });
         return json(
           await transaction(async (db) => {
             await lockOwner(db, uid);
@@ -308,7 +364,7 @@ async function handle(req: NextRequest, ctx: Context) {
             }
             const [r] = id
               ? await query(
-                  "UPDATE relationship_types SET code=$3,label=$4,reverse_label=$5,is_directed=$6 WHERE user_id=$1 AND id=$2 RETURNING *",
+                  "UPDATE relationship_types SET code=$3,label=$4,reverse_label=$5,is_directed=$6,is_active=$7 WHERE user_id=$1 AND id=$2 RETURNING *",
                   [
                     uid,
                     id,
@@ -316,20 +372,30 @@ async function handle(req: NextRequest, ctx: Context) {
                     d.label,
                     d.reverse_label ?? null,
                     d.is_directed,
+                    d.is_active,
                   ],
                   db,
                 )
               : await query(
-                  "INSERT INTO relationship_types(user_id,code,label,reverse_label,is_directed) VALUES($1,$2,$3,$4,$5) RETURNING *",
+                  "INSERT INTO relationship_types(user_id,code,label,reverse_label,is_directed,is_active) VALUES($1,$2,$3,$4,$5,$6) RETURNING *",
                   [
                     uid,
                     d.code,
                     d.label,
                     d.reverse_label ?? null,
                     d.is_directed,
+                    d.is_active,
                   ],
                   db,
                 );
+            await audit(
+              db,
+              uid,
+              id ? "update" : "create",
+              "relationship_type",
+              r.id,
+              Object.keys(d),
+            );
             return r;
           }),
           id ? 200 : 201,
@@ -337,13 +403,19 @@ async function handle(req: NextRequest, ctx: Context) {
       }
     }
     if (parts[0] === "important-dates") {
+      if (method === "GET" && id) {
+        const r = await owned(pool, "important_dates", uid, id);
+        return json({ ...r, notes: decrypt(r.notes) });
+      }
       if (method === "GET")
-        return json({
-          items: await query(
-            "SELECT d.*,p.display_name person_name FROM important_dates d JOIN people p ON p.id=d.person_id AND p.user_id=d.user_id WHERE d.user_id=$1 AND d.is_active AND p.is_active AND ($2::uuid IS NULL OR d.person_id=$2) ORDER BY d.month,d.day",
+        return json(
+          await pageQuery(
+            "SELECT d.*,p.display_name person_name FROM important_dates d JOIN people p ON p.id=d.person_id AND p.user_id=d.user_id WHERE d.user_id=$1 AND d.is_active AND p.is_active AND ($2::uuid IS NULL OR d.person_id=$2)",
             [uid, params.get("person_id")],
+            params,
+            (r) => ({ ...r, notes: decrypt(r.notes) }),
           ),
-        });
+        );
       if (method === "POST")
         return json(await saveDate(uid, await body()), 201);
       if (method === "PATCH" && id)
@@ -362,11 +434,11 @@ async function handle(req: NextRequest, ctx: Context) {
               [uid, id],
             );
             await db.query(
-              "UPDATE reminders SET is_enabled=false,version=version+1 WHERE user_id=$1 AND important_date_id=$2",
+              "UPDATE reminders SET is_enabled=false,version=version+1 WHERE user_id=$1 AND (important_date_id=$2 OR action_id IN(SELECT id FROM actions WHERE user_id=$1 AND important_date_id=$2))",
               [uid, id],
             );
             await db.query(
-              "UPDATE outbox_messages SET state='cancelled' WHERE user_id=$1 AND state IN('queued','retry_wait') AND (action_id IN(SELECT id FROM actions WHERE user_id=$1 AND important_date_id=$2) OR reminder_id IN(SELECT id FROM reminders WHERE user_id=$1 AND important_date_id=$2))",
+              "UPDATE outbox_messages SET state='cancelled' WHERE user_id=$1 AND state IN('queued','retry_wait') AND (action_id IN(SELECT id FROM actions WHERE user_id=$1 AND important_date_id=$2) OR reminder_id IN(SELECT id FROM reminders WHERE user_id=$1 AND (important_date_id=$2 OR action_id IN(SELECT id FROM actions WHERE user_id=$1 AND important_date_id=$2))))",
               [uid, id],
             );
             return { ok: true };
@@ -390,7 +462,7 @@ async function handle(req: NextRequest, ctx: Context) {
       if (parts.length === 1 && method === "GET") {
         const limit = Math.min(
           100,
-          Math.max(1, Number(params.get("limit")) || 30),
+          Math.max(1, Math.floor(Number(params.get("limit")) || 30)),
         );
         const rows = await query(
           `SELECT a.*,p.display_name person_name,o.state sms_state,o.error_code,o.scheduled_at calculated_sms_at FROM actions a JOIN people p ON p.id=a.person_id AND p.user_id=a.user_id LEFT JOIN outbox_messages o ON o.user_id=a.user_id AND o.dedupe_key='flower:'||a.id||':initial_sms' WHERE a.user_id=$1 AND ($2::text IS NULL OR a.status=$2) AND ($3::uuid IS NULL OR a.person_id=$3) AND ($4::timestamptz IS NULL OR a.due_at>=$4) AND ($5::timestamptz IS NULL OR a.due_at<=$5) AND ($6::uuid IS NULL OR a.id>$6) ORDER BY a.id LIMIT $7`,
@@ -451,28 +523,36 @@ async function handle(req: NextRequest, ctx: Context) {
     if (parts[0] === "interactions" && method === "POST")
       return json(await addInteraction(uid, await body()), 201);
     if (parts[0] === "florists") {
+      if (method === "GET" && id)
+        return json(await owned(pool, "florists", uid, id));
       if (method === "GET")
-        return json({
-          items: await query(
-            "SELECT * FROM florists WHERE user_id=$1 ORDER BY created_at",
+        return json(
+          await pageQuery(
+            "SELECT * FROM florists WHERE user_id=$1",
             [uid],
+            params,
           ),
-        });
+        );
       if (method === "POST")
         return json(await saveFlorist(uid, await body()), 201);
       if (method === "PATCH" && id)
         return json(await saveFlorist(uid, await body(), id));
     }
     if (parts[0] === "reminders") {
+      if (method === "GET" && id) {
+        const r = await owned(pool, "reminders", uid, id);
+        return json({ ...r, message: decrypt(r.message) });
+      }
       if (method === "GET")
-        return json({
-          items: (
-            await query(
-              "SELECT * FROM reminders WHERE user_id=$1 ORDER BY created_at DESC",
-              [uid],
-            )
-          ).map((r) => ({ ...r, message: decrypt(r.message) })),
-        });
+        return json(
+          await pageQuery(
+            "SELECT r.*,coalesce(r.person_id,a.person_id,d.person_id) target_person_id FROM reminders r LEFT JOIN actions a ON a.user_id=r.user_id AND a.id=r.action_id LEFT JOIN important_dates d ON d.user_id=r.user_id AND d.id=r.important_date_id WHERE r.user_id=$1",
+            [uid],
+            params,
+            (r) => ({ ...r, message: decrypt(r.message) }),
+            true,
+          ),
+        );
       if (method === "POST")
         return json(await saveReminder(user, await body()), 201);
       if (method === "PATCH" && id)
@@ -497,12 +577,18 @@ async function handle(req: NextRequest, ctx: Context) {
     }
     if (parts[0] === "notifications") {
       if (method === "GET")
-        return json({
-          items: await query(
-            "SELECT * FROM notifications WHERE user_id=$1 ORDER BY created_at DESC LIMIT 100",
+        return json(
+          await pageQuery(
+            "SELECT * FROM notifications WHERE user_id=$1",
             [uid],
+            params,
+            (r) => ({
+              ...r,
+              body: r.body?.startsWith("v1.") ? decrypt(r.body) : r.body,
+            }),
+            true,
           ),
-        });
+        );
       if (parts[2] === "read" && method === "POST") {
         await owned(pool, "notifications", uid, id);
         await query(
@@ -522,20 +608,30 @@ async function handle(req: NextRequest, ctx: Context) {
           payload: m.payload_snapshot
             ? JSON.parse(decrypt(m.payload_snapshot))
             : null,
-          logs: await query(
-            "SELECT * FROM sms_logs WHERE user_id=$1 AND outbox_message_id=$2 ORDER BY attempt_no",
-            [uid, id],
-          ),
+          logs: (
+            await query(
+              "SELECT * FROM sms_logs WHERE user_id=$1 AND outbox_message_id=$2 ORDER BY attempt_no",
+              [uid, id],
+            )
+          ).map((log) => ({
+            ...log,
+            recipient_mobile_snapshot: decrypt(log.recipient_mobile_snapshot),
+            message_snapshot: decrypt(log.message_snapshot),
+          })),
         });
       }
       if (method === "GET")
-        return json({
-          items: await query(
-            "SELECT id,action_id,channel,state,error_code,attempt_count,scheduled_at,updated_at,provider_message_id FROM outbox_messages WHERE user_id=$1 ORDER BY created_at DESC LIMIT 100",
+        return json(
+          await pageQuery(
+            "SELECT id,action_id,channel,state,error_code,attempt_count,scheduled_at,updated_at,created_at,provider_message_id FROM outbox_messages WHERE user_id=$1",
             [uid],
+            params,
+            (r) => r,
+            true,
           ),
-        });
+        );
     }
+
     if (parts[0] === "imports") {
       if (route === "imports/template" && method === "GET")
         return new NextResponse(
@@ -549,9 +645,13 @@ async function handle(req: NextRequest, ctx: Context) {
           },
         );
       if (route === "imports/people" && method === "POST") {
-        const file = (await req.formData()).get("file");
+        const form = await formBody(req),
+          file = form.get("file");
         if (!(file instanceof File)) fail("فایل را انتخاب کنید.");
-        return json(await uploadImport(uid, file), 202);
+        return json(
+          await uploadImport(uid, file, form.get("allow_duplicate") === "true"),
+          202,
+        );
       }
       if (id && method === "GET" && parts.length === 2)
         return json(await getImport(uid, id));
@@ -560,7 +660,10 @@ async function handle(req: NextRequest, ctx: Context) {
       if (id && parts[2] === "validate" && method === "POST")
         return json(await updateImport(uid, id, {}));
       if (id && parts[2] === "commit" && method === "POST")
-        return json(await commitImport(uid, id, (await body()).checksum), 202);
+        return json(
+          await requestImportCommit(uid, id, (await body()).checksum),
+          202,
+        );
       if (id && parts[2] === "errors" && method === "GET") {
         const job = await getImport(uid, id);
         const csv = [
@@ -698,5 +801,18 @@ async function handle(req: NextRequest, ctx: Context) {
       500,
     );
   }
+}
+async function handle(req: NextRequest, ctx: Context) {
+  const requestId = randomUUID();
+  const response = await auditContext.run({ requestId }, () =>
+    execute(req, ctx, requestId),
+  );
+  if (response.status >= 500)
+    try {
+      await query(
+        "INSERT INTO api_error_metrics(hour,error_count) VALUES(date_trunc('hour',now()),1) ON CONFLICT(hour) DO UPDATE SET error_count=api_error_metrics.error_count+1",
+      );
+    } catch {}
+  return response;
 }
 export { handle as GET, handle as POST, handle as PATCH, handle as DELETE };

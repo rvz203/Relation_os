@@ -9,6 +9,7 @@ type Edge = {
   target: string;
   kind: string;
   label: string;
+  directed?: boolean;
 };
 type GraphData = {
   nodes: Person[];
@@ -201,18 +202,35 @@ export function Graph({
             preserveAspectRatio="none"
             aria-hidden="true"
           >
+            <defs>
+              <marker
+                id={compact ? "compact-arrow" : "network-arrow"}
+                markerWidth="2"
+                markerHeight="2"
+                refX="10"
+                refY="5"
+                viewBox="0 0 10 10"
+                orient="auto"
+                markerUnits="userSpaceOnUse"
+              >
+                <path d="M0,0 L10,5 L0,10 Z" fill="#8ba0ca" />
+              </marker>
+            </defs>
             <circle cx="50" cy="48" r="12" className="orbit" />
             <circle cx="50" cy="48" r="21" className="orbit faint" />
             {edges.map((e) => {
               const a = coordinates(e.source),
                 b = coordinates(e.target);
               return (
-                <line
+                <polyline
                   key={e.id}
-                  x1={a.x}
-                  y1={a.y}
-                  x2={b.x}
-                  y2={b.y}
+                  markerMid={
+                    e.directed
+                      ? `url(#${compact ? "compact-arrow" : "network-arrow"})`
+                      : undefined
+                  }
+                  points={`${a.x},${a.y} ${(a.x+b.x)/2},${(a.y+b.y)/2} ${b.x},${b.y}`}
+                  fill="none"
                   className={e.kind === "relationship" ? "secondary-edge" : ""}
                 />
               );
@@ -246,6 +264,16 @@ export function Graph({
                   }}
                 >
                   <Avatar p={p} />
+                  {!p.is_self && (
+                    <span
+                      className={
+                        "level-badge node-importance level-" +
+                        p.importance_level
+                      }
+                    >
+                      {p.importance_level}
+                    </span>
+                  )}
                   <span className="node-name">
                     {p.is_self ? "شما" : p.display_name}
                   </span>

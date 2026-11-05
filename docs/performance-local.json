@@ -1,0 +1,39 @@
+{
+  "at": "2026-11-05T04:23:59.993Z",
+  "environment": "local macOS; Next.js production server; PostgreSQL; synthetic disposable owner",
+  "people": 10000,
+  "relationships": 50000,
+  "concurrent_sessions": 10,
+  "results": [
+    {
+      "route": "people?limit=30",
+      "requests": 150,
+      "p50_ms": 11,
+      "p95_ms": 18,
+      "max_ms": 30
+    },
+    {
+      "route": "people?limit=30&q=%D8%A2%D8%B2%D9%85%D8%A7%DB%8C%D8%B4%2050",
+      "requests": 150,
+      "p50_ms": 12,
+      "p95_ms": 16,
+      "max_ms": 19
+    },
+    {
+      "route": "people?limit=30&q=%D8%B4%D8%B1%DA%A9%D8%AA",
+      "requests": 150,
+      "p50_ms": 9,
+      "p95_ms": 13,
+      "max_ms": 18
+    },
+    {
+      "route": "network?depth=2&limit=200",
+      "requests": 150,
+      "p50_ms": 49,
+      "p95_ms": 65,
+      "max_ms": 77
+    }
+  ],
+  "passes_list_search_target": true,
+  "scope": "Local measurement only; repeat on production-equivalent infrastructure."
+}

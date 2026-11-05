@@ -14,8 +14,14 @@ import {
   DialogDescription,
   DialogTitle,
 } from "@/components/ui/dialog";
-import { api, fa, labels, type Person, type User } from "@/lib/client";
-import { flowerSchedule, faDate } from "@/lib/calendar";
+import { api, apiAll, fa, labels, type Person, type User } from "@/lib/client";
+import { DateField, SourceDateFields } from "./date-field";
+import {
+  flowerSchedule,
+  faDate,
+  nextOccurrence,
+  zonedInstant,
+} from "@/lib/calendar";
 import { Busy, ErrorBox, PersonPicker } from "./common";
 export type Workflow = {
   type:
@@ -68,9 +74,13 @@ export function WorkflowModal({
     [person, setPerson] = useState(
       w.type === "relationship"
         ? (record.person_b_id ?? "")
-        : (p?.id ?? record.person_id ?? ""),
+        : (p?.id ?? record.target_person_id ?? record.person_id ?? ""),
     ),
-    [parent, setParent] = useState(p?.introduced_by_person_id ?? ""),
+    [parent, setParent] = useState(
+      w.type === "relationship"
+        ? (record.introduced_by_person_id ?? "")
+        : (p?.introduced_by_person_id ?? ""),
+    ),
     [source, setSource] = useState(p?.introduction_source ?? "direct");
   const [types, setTypes] = useState<any[]>([]),
     [florists, setFlorists] = useState<any[]>([]),
@@ -81,17 +91,32 @@ export function WorkflowModal({
   const key = useRef(crypto.randomUUID());
   const flowerCache = useRef<Record<string, string>>({});
   const [dates, setDates] = useState<any[]>([]),
-    [dateId, setDateId] = useState(w.event?.id ?? "");
+    [dateId, setDateId] = useState(
+      w.event?.id ?? record.important_date_id ?? "",
+    );
+  const [channel, setChannel] = useState(record.channel ?? "in_app"),
+    [reminderTarget, setReminderTarget] = useState(
+      record.action_id
+        ? "action"
+        : record.important_date_id
+          ? "occasion"
+          : "person",
+    ),
+    [actionTarget, setActionTarget] = useState(record.action_id ?? ""),
+    [personActions, setPersonActions] = useState<any[]>([]),
+    [occurrence, setOccurrence] = useState(
+      w.event?.occurrence_date ?? record.occurrence_date ?? "",
+    );
   const zone = user.timezone,
     now = DateTime.now().setZone(zone),
     today = now.toISODate()!;
   useEffect(() => {
     if (w.type === "relationship")
-      api("relationship-types")
+      apiAll("relationship-types")
         .then((d) => setTypes(d.items))
         .catch(setError);
     if (w.type === "flower")
-      api("florists")
+      apiAll("florists")
         .then((d) => setFlorists(d.items))
         .catch(setError);
     if (w.type === "sms")
@@ -100,10 +125,15 @@ export function WorkflowModal({
         .catch(setError);
   }, []);
   useEffect(() => {
-    if (w.type === "reminder" && person)
-      api("important-dates?person_id=" + person)
+    if (["reminder", "action", "flower"].includes(w.type) && person) {
+      apiAll("important-dates?person_id=" + person)
         .then((d) => setDates(d.items))
         .catch(setError);
+      if (w.type === "reminder")
+        apiAll("actions?status=pending&person_id=" + person)
+          .then((d) => setPersonActions(d.items))
+          .catch(setError);
+    }
   }, [person, w.type]);
   const execute = async (work: () => Promise<any>) => {
     if (busy) return;
@@ -121,7 +151,7 @@ export function WorkflowModal({
   const toUTC = (value: string) => {
     const dt = DateTime.fromISO(value, { zone });
     if (!dt.isValid) throw new Error("تاریخ و ساعت معتبر نیست.");
-    return dt.toUTC().toISO()!;
+    return zonedInstant(value.slice(0, 10), value.slice(11, 16), zone);
   };
   const submit = (e: React.FormEvent<HTMLFormElement>) => {
     e.preventDefault();
@@ -134,10 +164,9 @@ export function WorkflowModal({
         person_id: person,
         action_type: "flower",
         title: d.title || "ارسال گل",
-        important_date_id: w.event?.id ?? record.important_date_id ?? null,
-        occurrence_date:
-          w.event?.occurrence_date ?? record.occurrence_date ?? null,
-        due_at: toUTC(delivery + "T10:00"),
+        important_date_id: dateId || null,
+        occurrence_date: dateId ? d.occurrence_date || occurrence : null,
+        due_at: toUTC(delivery + "T" + (d.delivery_local_time || "10:00")),
         version: record.version,
         flower: {
           florist_id: d.florist_id,
@@ -146,6 +175,8 @@ export function WorkflowModal({
           delivery_date: delivery,
           delivery_address: d.delivery_address,
           card_message: d.card_message,
+          notes: d.flower_notes,
+          delivery_local_time: d.delivery_local_time || null,
         },
         florist,
       });
@@ -166,6 +197,15 @@ export function WorkflowModal({
               .map((t) => t.trim())
               .filter(Boolean),
             version: p?.version,
+            first_met_on: d.first_met_on || null,
+            expertise: d.tags
+              .split(/[,،;]/)
+              .map((t) => t.trim())
+              .filter(Boolean),
+            labels: (d.labels ?? "")
+              .split(/[,،;]/)
+              .map((t) => t.trim())
+              .filter(Boolean),
           },
           key.current,
         );
@@ -177,6 +217,9 @@ export function WorkflowModal({
             ...d,
             person_id: person,
             due_at: toUTC(d.due_at),
+            important_date_id: dateId || null,
+            occurrence_date: dateId ? d.occurrence_date : null,
+            reminder_at: d.reminder_at ? toUTC(d.reminder_at) : null,
             version: record.version,
           },
           key.current,
@@ -199,6 +242,7 @@ export function WorkflowModal({
             interaction_type: d.interaction_type,
             notes: d.notes,
             occurred_at: toUTC(d.occurred_at),
+            direction: d.direction,
           },
           key.current,
         );
@@ -227,6 +271,8 @@ export function WorkflowModal({
             person_a_id: record.person_a_id ?? p?.id,
             person_b_id: person,
             version: record.version,
+            introduced_by_person_id: parent || null,
+            start_date: d.start_date || null,
           },
           key.current,
         );
@@ -239,20 +285,24 @@ export function WorkflowModal({
         );
       if (w.type === "reminder")
         return api(
-          "reminders",
-          "POST",
+          "reminders" + (record.id ? "/" + record.id : ""),
+          record.id ? "PATCH" : "POST",
           {
-            person_id: dateId ? null : person,
-            important_date_id: dateId || null,
-            channel: d.channel,
+            person_id: reminderTarget === "person" ? person : null,
+            important_date_id: reminderTarget === "occasion" ? dateId : null,
+            action_id: reminderTarget === "action" ? actionTarget : null,
+            channel,
             recipient_person_id:
-              d.channel === "sms" && d.recipient === "person" ? person : null,
+              channel === "sms" && d.recipient === "person" ? person : null,
             message: d.message,
-            schedule_mode: dateId ? "per_occurrence" : "once",
-            scheduled_at: dateId ? null : toUTC(d.scheduled_at),
+            schedule_mode:
+              reminderTarget === "occasion" ? "per_occurrence" : "once",
+            scheduled_at:
+              reminderTarget === "occasion" ? null : toUTC(d.scheduled_at),
             offset_days: Number(d.offset_days || 0),
             local_time: d.local_time || "09:00",
             timezone: zone,
+            version: record.version,
           },
           key.current,
         );
@@ -268,6 +318,41 @@ export function WorkflowModal({
       if (w.type === "password") return api("auth/password", "POST", d);
     });
   };
+  const occasionField = (
+    <>
+      <label>
+        مناسبت مرتبط
+        <select
+          value={dateId}
+          onChange={(e) => {
+            setDateId(e.target.value);
+            const date = dates.find((d) => d.id === e.target.value);
+            setOccurrence(date ? (nextOccurrence(date, today) ?? "") : "");
+          }}
+        >
+          <option value="">بدون مناسبت</option>
+          {dates.map((d) => (
+            <option key={d.id} value={d.id}>
+              {d.title}
+            </option>
+          ))}
+        </select>
+      </label>
+      {dateId && (
+        <label>
+          نوبت مشخص مناسبت
+          <DateField
+            key={dateId + occurrence}
+            name="occurrence_date"
+            required
+            calendar={user.ui_calendar}
+            defaultValue={occurrence}
+            label="نوبت مناسبت"
+          />
+        </label>
+      )}
+    </>
+  );
   const personField = (label = "شخص") => (
     <PersonPicker
       value={person}
@@ -280,7 +365,9 @@ export function WorkflowModal({
     <div className="form-footer">
       <button
         type="submit"
-        disabled={busy || (w.type === "sms" && !preview)}
+        disabled={
+          busy || (w.type === "sms" && (!preview || preview.send_started))
+        }
         className="primary"
       >
         {busy ? (
@@ -294,14 +381,16 @@ export function WorkflowModal({
             ? "بایگانی و توقف برنامه‌ها"
             : "ذخیره اطلاعات"}
       </button>
-      <button
-        type="button"
-        className="secondary"
-        onClick={onClose}
-        disabled={busy}
-      >
-        انصراف
-      </button>
+      {!(w.type === "password" && user.must_change_password) && (
+        <button
+          type="button"
+          className="secondary"
+          onClick={onClose}
+          disabled={busy}
+        >
+          انصراف
+        </button>
+      )}
     </div>
   );
   return (
@@ -371,10 +460,10 @@ export function WorkflowModal({
               )}
               <div className="form-two">
                 <label>
-                  تخصص و برچسب
+                  تخصص‌ها
                   <input
                     name="tags"
-                    defaultValue={p?.tags?.join("، ")}
+                    defaultValue={(p?.expertise ?? p?.tags)?.join("، ")}
                     placeholder="با ویرگول جدا کنید"
                   />
                 </label>
@@ -393,6 +482,68 @@ export function WorkflowModal({
               <details open={!!p}>
                 <summary>اطلاعات تکمیلی</summary>
                 <div className="form-stack">
+                  <div className="form-two">
+                    <label>
+                      نام کوچک
+                      <input name="first_name" defaultValue={p?.first_name} />
+                    </label>
+                    <label>
+                      نام خانوادگی
+                      <input name="last_name" defaultValue={p?.last_name} />
+                    </label>
+                  </div>
+                  <label>
+                    برچسب‌ها
+                    <input
+                      name="labels"
+                      defaultValue={p?.labels?.join("، ")}
+                      placeholder="با ویرگول جدا کنید"
+                    />
+                  </label>
+                  <div className="form-two">
+                    <label>
+                      جنسیت
+                      <input name="gender" defaultValue={p?.gender} />
+                    </label>
+                    <label>
+                      کد کشور
+                      <input
+                        name="country_code"
+                        maxLength={2}
+                        dir="ltr"
+                        defaultValue={p?.country_code}
+                        placeholder="IR"
+                      />
+                    </label>
+                  </div>
+                  <div className="form-two">
+                    <label>
+                      صنعت
+                      <input name="industry" defaultValue={p?.industry} />
+                    </label>
+                    <label>
+                      حوزه فعالیت
+                      <input
+                        name="activity_area"
+                        defaultValue={p?.activity_area}
+                      />
+                    </label>
+                  </div>
+                  <label>
+                    تاریخ اولین آشنایی
+                    <DateField
+                      name="first_met_on"
+                      defaultValue={p?.first_met_on}
+                      calendar={user.ui_calendar}
+                    />
+                  </label>
+                  <label>
+                    توضیحات آشنایی
+                    <textarea
+                      name="acquaintance_notes"
+                      defaultValue={p?.acquaintance_notes}
+                    />
+                  </label>
                   <div className="form-two">
                     <label>
                       شرکت
@@ -440,6 +591,7 @@ export function WorkflowModal({
           {w.type === "action" && (
             <>
               {personField()}
+              {occasionField}
               <label>
                 عنوان اقدام
                 <input
@@ -473,10 +625,12 @@ export function WorkflowModal({
                 </label>
                 <label>
                   موعد <small>به وقت {zone}</small>
-                  <input
-                    type="datetime-local"
+                  <DateField
                     name="due_at"
                     required
+                    time
+                    calendar={user.ui_calendar}
+                    label="موعد اقدام"
                     defaultValue={
                       record.due_at
                         ? DateTime.fromISO(record.due_at)
@@ -490,6 +644,15 @@ export function WorkflowModal({
               <label>
                 یادداشت
                 <textarea name="notes" defaultValue={record.notes} />
+              </label>
+              <label>
+                افزودن یادآور این اقدام (اختیاری)
+                <DateField
+                  name="reminder_at"
+                  time
+                  calendar={user.ui_calendar}
+                  label="یادآور اقدام"
+                />
               </label>
               <button
                 className="text-button"
@@ -514,6 +677,7 @@ export function WorkflowModal({
                   </span>
                 </div>
                 {personField("گیرنده گل")}
+                {occasionField}
                 <label>
                   عنوان سفارش
                   <input
@@ -556,12 +720,12 @@ export function WorkflowModal({
                   </label>
                 </div>
                 <label>
-                  تاریخ تحویل میلادی
-                  <input
+                  تاریخ تحویل
+                  <DateField
                     name="delivery_date"
-                    type="date"
                     required
-                    min={today}
+                    calendar={user.ui_calendar}
+                    label="تحویل گل"
                     defaultValue={
                       flowerCache.current.delivery_date ??
                       record.delivery_date ??
@@ -595,6 +759,23 @@ export function WorkflowModal({
                     }
                   />
                 </label>
+                <div className="form-two">
+                  <label>
+                    ساعت تحویل (اختیاری)
+                    <input
+                      name="delivery_local_time"
+                      type="time"
+                      defaultValue={record.delivery_local_time ?? ""}
+                    />
+                  </label>
+                  <label>
+                    توضیحات تحویل
+                    <textarea
+                      name="flower_notes"
+                      defaultValue={record.flower_notes}
+                    />
+                  </label>
+                </div>
                 <label>
                   گلفروش
                   <select
@@ -704,15 +885,23 @@ export function WorkflowModal({
                 </label>
                 <label>
                   زمان واقعی تعامل
-                  <input
-                    type="datetime-local"
+                  <DateField
                     name="occurred_at"
+                    time
                     required
-                    max={now.toFormat("yyyy-MM-dd'T'HH:mm")}
+                    calendar={user.ui_calendar}
+                    label="تعامل"
                     defaultValue={now.toFormat("yyyy-MM-dd'T'HH:mm")}
                   />
                 </label>
               </div>
+              <label>
+                جهت تعامل
+                <select name="direction">
+                  <option value="outgoing">از طرف من</option>
+                  <option value="incoming">از طرف شخص</option>
+                </select>
+              </label>
               <label>
                 شرح تعامل
                 <textarea name="notes" autoFocus required rows={4} />
@@ -754,30 +943,6 @@ export function WorkflowModal({
                   </select>
                 </label>
               </div>
-              <div className="form-two">
-                <label>
-                  ماه
-                  <input
-                    type="number"
-                    name="month"
-                    required
-                    min={1}
-                    max={12}
-                    defaultValue={record.month}
-                  />
-                </label>
-                <label>
-                  روز
-                  <input
-                    type="number"
-                    name="day"
-                    required
-                    min={1}
-                    max={31}
-                    defaultValue={record.day}
-                  />
-                </label>
-              </div>
               <label>
                 تکرار
                 <select
@@ -788,16 +953,14 @@ export function WorkflowModal({
                   <option value="none">یک‌باره</option>
                 </select>
               </label>
+              <SourceDateFields
+                calendar={calendar}
+                record={record}
+                repeat={repeat}
+              />
               <label>
-                سال {repeat === "yearly" ? "(اختیاری)" : ""}
-                <input
-                  type="number"
-                  name="original_year"
-                  required={repeat === "none"}
-                  min={1}
-                  max={9999}
-                  defaultValue={record.original_year ?? ""}
-                />
+                یادداشت مناسبت
+                <textarea name="notes" defaultValue={record.notes} />
               </label>
               <label>
                 روز کبیسه در سال غیرکبیسه
@@ -818,6 +981,21 @@ export function WorkflowModal({
                 جهت‌دار، این شخص مبدأ است.
               </p>
               {personField("طرف رابطه")}
+              <PersonPicker
+                name="relationship_introducer"
+                value={parent}
+                onChange={setParent}
+                label="معرفی‌کننده رابطه (اختیاری)"
+                required={false}
+              />
+              <label>
+                شروع رابطه
+                <DateField
+                  name="start_date"
+                  defaultValue={record.start_date}
+                  calendar={user.ui_calendar}
+                />
+              </label>
               <label>
                 نوع رابطه
                 <select
@@ -878,66 +1056,110 @@ export function WorkflowModal({
             <>
               {personField()}
               <label>
-                مناسبت مرتبط
+                هدف یادآوری
                 <select
-                  value={dateId}
-                  onChange={(e) => setDateId(e.target.value)}
+                  value={reminderTarget}
+                  onChange={(e) => setReminderTarget(e.target.value)}
                 >
-                  <option value="">یادآوری یک‌باره برای شخص</option>
-                  {dates.map((d) => (
-                    <option value={d.id} key={d.id}>
-                      {d.title} · هر نوبت مناسبت
-                    </option>
-                  ))}
+                  <option value="person">شخص · یک‌باره</option>
+                  <option value="occasion">مناسبت · هر نوبت</option>
+                  <option value="action">اقدام · یک‌باره</option>
                 </select>
               </label>
-              {dateId ? (
+              {reminderTarget === "occasion" && (
+                <label>
+                  مناسبت
+                  <select
+                    required
+                    value={dateId}
+                    onChange={(e) => setDateId(e.target.value)}
+                  >
+                    <option value="">انتخاب کنید</option>
+                    {dates.map((d) => (
+                      <option value={d.id} key={d.id}>
+                        {d.title}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+              )}
+              {reminderTarget === "action" && (
+                <label>
+                  اقدام
+                  <select
+                    required
+                    value={actionTarget}
+                    onChange={(e) => setActionTarget(e.target.value)}
+                  >
+                    <option value="">انتخاب کنید</option>
+                    {personActions.map((a) => (
+                      <option value={a.id} key={a.id}>
+                        {a.title}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+              )}
+              {reminderTarget === "occasion" ? (
                 <div className="form-two">
                   <label>
-                    فاصله روز <small>منفی یعنی قبل از مناسبت</small>
+                    فاصله روز (منفی یعنی قبل)
                     <input
                       name="offset_days"
                       type="number"
                       min={-365}
                       max={365}
-                      defaultValue={-1}
-                      required
+                      defaultValue={record.offset_days ?? -1}
                     />
                   </label>
                   <label>
                     ساعت
                     <input
-                      type="time"
                       name="local_time"
-                      defaultValue="09:00"
+                      type="time"
                       required
+                      defaultValue={record.local_time ?? "09:00"}
                     />
                   </label>
                 </div>
               ) : (
                 <label>
                   موعد
-                  <input
+                  <DateField
                     name="scheduled_at"
-                    type="datetime-local"
-                    defaultValue={now
-                      .plus({ days: 1 })
-                      .toFormat("yyyy-MM-dd'T'HH:mm")}
+                    time
                     required
+                    calendar={user.ui_calendar}
+                    defaultValue={
+                      record.scheduled_at
+                        ? DateTime.fromISO(record.scheduled_at)
+                            .setZone(zone)
+                            .toFormat("yyyy-MM-dd'T'HH:mm")
+                        : now.plus({ days: 1 }).toFormat("yyyy-MM-dd'T'HH:mm")
+                    }
                   />
                 </label>
               )}
               <div className="form-two">
                 <label>
                   کانال
-                  <select name="channel">
+                  <select
+                    value={channel}
+                    onChange={(e) => setChannel(e.target.value)}
+                  >
                     <option value="in_app">اعلان داخل برنامه</option>
                     <option value="sms">پیامک</option>
                   </select>
                 </label>
                 <label>
                   گیرنده پیامک
-                  <select name="recipient">
+                  <select
+                    name="recipient"
+                    disabled={channel === "in_app"}
+                    defaultValue={
+                      record.recipient_person_id ? "person" : "user"
+                    }
+                  >
                     <option value="user">خودم</option>
                     <option value="person">شخص انتخاب‌شده</option>
                   </select>
@@ -945,7 +1167,12 @@ export function WorkflowModal({
               </div>
               <label>
                 متن یادآوری
-                <textarea name="message" required rows={3} />
+                <textarea
+                  name="message"
+                  required
+                  rows={3}
+                  defaultValue={record.message}
+                />
               </label>
               <p className="muted">
                 منطقه زمانی: {zone}. اعلان داخل برنامه همیشه به حساب شما می‌رسد.
@@ -971,6 +1198,11 @@ export function WorkflowModal({
                       : "با تأیید، این متن و نشانی برای گلفروش ارسال می‌شوند."}
                     <br />
                     پذیرش پیام توسط سرویس، به معنی تحویل گل یا پیام نیست.
+                    {preview.send_started && (
+                      <p>
+                        ارسال آغاز شده است؛ پیام اولیه دوباره ارسال نمی‌شود.
+                      </p>
+                    )}
                   </div>
                 </>
               )

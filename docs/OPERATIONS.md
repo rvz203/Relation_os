@@ -6,7 +6,11 @@ Use separate development, test and production databases and keys. Run the migrat
 
 `GET /api/health` verifies the database connection. `worker_health.last_seen_at` records the scheduler heartbeat. Monitor messages in `unknown`, `failed`, and overdue `queued`/`retry_wait` states. Alert when the scheduler heartbeat or oldest ready message is more than ten minutes old. Settings displays outbound message state and allows provider reconciliation.
 
-`npm run maintenance` applies the implemented retention cleanup: expired imports (seven days), sessions, throttling windows, idempotency responses (seven days), completed message bodies (ninety days) and audit records (one year). Outbound intent keys and completed-action dedupe keys remain durable to prevent replays. Schedule maintenance with the hosting platform. Review policy and encryption-key rotation before production; automatic key rotation and external operational alerts are not configured.
+`npm run maintenance` applies the implemented retention cleanup: expired imports (seven days), sessions, throttling windows, idempotency responses (seven days), completed message bodies (ninety days) and audit records (one year). Outbound intent keys and completed-action dedupe keys remain durable to prevent replays. Schedule maintenance with the hosting platform. Import staging is purged while checksum/job metadata remains available for duplicate detection. Per-attempt SMS text/recipient snapshots are also purged at ninety days. Review policy and encryption-key rotation before production; automatic key rotation is not configured.
+
+Run `npm run monitor` as an independent service (included in Compose). It checks every minute and creates deduplicated in-app incidents for stale heartbeat, queue delays, unknown messages, repeated API errors and low configured provider credit. Optional `OPS_ALERT_URL`/`OPS_ALERT_TOKEN` deliver incident codes and owner IDs to your HTTPS receiver. Settings and `GET /api/v1/operations` expose these metrics. Configure your actual incident receiver before production; none is connected locally.
+
+The worker also processes frozen import commits asynchronously. Poll the import job until `committed` or `failed`; a failed commit rolls back all network changes. Expired processing leases can be reclaimed. Imported expertise and labels remain separate.
 
 ## SMS adapter
 
@@ -15,12 +19,14 @@ Default `SMS_MODE=sandbox` returns a synthetic **accepted** result with a `sandb
 The adapter sends an HTTPS `POST` with bearer authentication and an `Idempotency-Key` equal to the immutable outbound message UUID:
 
 ```json
-{"to":"+989...","text":"...","client_reference":"outbox UUID"}
+{ "to": "+989...", "text": "...", "client_reference": "outbox UUID" }
 ```
 
-The provider gateway must return `{ "status": "accepted", "id": "provider identifier" }` or `{ "status": "rejected" }`. HTTP 429 means definitely unaccepted and may be retried. Other 4xx responses are rejected. Timeouts, server errors and malformed success responses become **unknown**, because the provider may have accepted the message. Unknown messages are never automatically resent.
+The provider gateway must return `{ "status": "accepted", "id": "provider identifier" }` or `{ "status": "rejected" }`. HTTP 429 means definitely unaccepted and may be retried. HTTP 408 is unknown; other 4xx responses are rejected. Timeouts, server errors and malformed success responses become **unknown**, because the provider may have accepted the message. Unknown messages are never automatically resent.
 
 For reconciliation, the gateway must support authenticated `GET SMS_API_URL/{provider_message_id_or_client_reference}` returning `accepted`, `delivered`, `failed` or `unknown`. Adapt this contract to the selected Iranian SMS provider and test its idempotency/status behavior in its sandbox before enabling real sends. No provider-specific integration has been selected or verified.
+
+Optional `SMS_BALANCE_URL` must return `{ "balance": number }` under the same bearer token. The monitor polls it, records the last balance/time and alerts at `SMS_LOW_BALANCE_THRESHOLD`; unset endpoints are displayed as not configured. `SMS_MAX_CHARACTERS`, `SMS_RETRY_MINUTES` and `REMINDER_GRACE_HOURS` expose the adapter limits. Maximum retries remain three after the initial attempt.
 
 Optional receipts go to `POST /api/v1/sms/webhooks/http`. Configure `SMS_WEBHOOK_SECRET`. Headers:
 
@@ -46,6 +52,8 @@ With `DATABASE_URL` and `BACKUP_PASSWORD` in the process environment:
 ```bash
 scripts/ops/backup.sh /secure/backup/directory
 ```
+
+Successful backups rotate only matching encrypted backup files older than `BACKUP_RETENTION_DAYS` (minimum thirty days). Schedule this command daily using the hosting scheduler and alert on failure; local scripts do not create a production schedule.
 
 To restore into a dedicated recovery database, first stop the worker and point `DATABASE_URL` at the recovery target. The restore replaces that target's objects. Set `RESTORE_ACK=I_HAVE_STOPPED_SMS`, then:
 

@@ -37,16 +37,31 @@ export function PersonPicker({
   onChange,
   label = "شخص",
   initial,
+  required = true,
 }: {
   name?: string;
   value: string;
   onChange: (id: string) => void;
   label?: string;
   initial?: Person;
+  required?: boolean;
 }) {
   const [q, setQ] = useState(""),
     [items, setItems] = useState<Person[]>(initial ? [initial] : []),
     [error, setError] = useState("");
+  const [selected, setSelected] = useState<Person | undefined>(initial);
+  useEffect(() => {
+    if (!value || value === selected?.id) return;
+    let alive = true;
+    api("people/" + value)
+      .then((p) => {
+        if (alive) setSelected(p);
+      })
+      .catch(() => {});
+    return () => {
+      alive = false;
+    };
+  }, [value, selected?.id]);
   useEffect(() => {
     let alive = true;
     const timer = setTimeout(() => {
@@ -54,8 +69,8 @@ export function PersonPicker({
         .then((d) => {
           if (alive) {
             setItems(
-              initial && !d.items.some((p: Person) => p.id === initial.id)
-                ? [initial, ...d.items]
+              selected && !d.items.some((p: Person) => p.id === selected.id)
+                ? [selected, ...d.items]
                 : d.items,
             );
             setError("");
@@ -67,7 +82,7 @@ export function PersonPicker({
       alive = false;
       clearTimeout(timer);
     };
-  }, [q, initial]);
+  }, [q, selected]);
   return (
     <label>
       {label}
@@ -82,7 +97,7 @@ export function PersonPicker({
       </div>
       <select
         name={name}
-        required
+        required={required}
         value={value}
         onChange={(e) => onChange(e.target.value)}
       >

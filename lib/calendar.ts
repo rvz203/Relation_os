@@ -83,13 +83,32 @@ export function nextOccurrence(d: ImportantDate, from = localToday()) {
   );
 }
 export function zonedInstant(day: string, time: string, zone: string) {
-  const dt = DateTime.fromISO(`${day}T${time}`, { zone });
-  if (!dt.isValid) throw new Error("Invalid local date or timezone");
-  return dt
-    .getPossibleOffsets()
-    .sort((a, b) => a.toMillis() - b.toMillis())[0]
-    .toUTC()
-    .toISO()!;
+  let wall = DateTime.fromISO(`${day}T${time}`, { zone: "UTC" });
+  if (!wall.isValid || !DateTime.now().setZone(zone).isValid)
+    throw new Error("Invalid local date or timezone");
+  // A spring-forward gap advances to the first valid local minute, not by the gap's duration.
+  for (let i = 0; i <= 2880; i++, wall = wall.plus({ minutes: 1 })) {
+    const local = DateTime.fromObject(
+      {
+        year: wall.year,
+        month: wall.month,
+        day: wall.day,
+        hour: wall.hour,
+        minute: wall.minute,
+      },
+      { zone },
+    );
+    if (
+      local.toFormat("yyyy-MM-dd'T'HH:mm") ===
+      wall.toFormat("yyyy-MM-dd'T'HH:mm")
+    )
+      return local
+        .getPossibleOffsets()
+        .sort((a, b) => a.toMillis() - b.toMillis())[0]
+        .toUTC()
+        .toISO()!;
+  }
+  throw new Error("No valid local time found");
 }
 export function flowerSchedule(delivery: string, time: string, zone: string) {
   const previous = DateTime.fromISO(delivery, { zone })
@@ -103,12 +122,19 @@ export function flowerSchedule(delivery: string, time: string, zone: string) {
       .toISO()!,
   };
 }
+let displayZone = "Asia/Tehran",
+  displayCalendar = "persian";
+export function setDisplayPreferences(zone: string, calendar: string) {
+  displayZone = zone;
+  displayCalendar = calendar === "gregorian" ? "gregory" : "persian";
+}
 export function faDate(
   value: string | Date,
   options: Intl.DateTimeFormatOptions = {},
 ) {
   return new Intl.DateTimeFormat("fa-IR", {
-    timeZone: "Asia/Tehran",
+    timeZone: displayZone,
+    calendar: displayCalendar,
     month: "long",
     day: "numeric",
     ...options,

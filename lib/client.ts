@@ -17,6 +17,17 @@ export type Person = {
   last_interaction_at?: string;
   photo_key?: string;
   is_self?: boolean;
+  expertise?: string[];
+  labels?: string[];
+  first_name?: string;
+  last_name?: string;
+  gender?: string;
+  country_code?: string;
+  industry?: string;
+  activity_area?: string;
+  first_met_on?: string;
+  acquaintance_notes?: string;
+  next_action?: Action;
   version: number;
 };
 export type Action = {
@@ -41,6 +52,8 @@ export type User = {
   sms_enabled: boolean;
   csrf_token: string;
   sms_mode: string;
+  ui_calendar?: "jalali" | "gregorian";
+  must_change_password?: boolean;
 };
 let csrf = "";
 export const setCsrf = (value: string) => {
@@ -68,19 +81,32 @@ export async function api<T = any>(
   }
   if (body && !(body instanceof FormData))
     headers["Content-Type"] = "application/json";
-  const response = await fetch("/api/v1/" + route, {
-    method,
-    headers,
-    body:
-      body instanceof FormData ? body : body ? JSON.stringify(body) : undefined,
-    cache: "no-store",
-  });
+  let response: Response;
+  try {
+    response = await fetch("/api/v1/" + route, {
+      method,
+      headers,
+      body:
+        body instanceof FormData
+          ? body
+          : body
+            ? JSON.stringify(body)
+            : undefined,
+      cache: "no-store",
+    });
+  } catch {
+    throw new Error(
+      "ارتباط با سرور قطع است. دوباره تلاش کنید؛ اطلاعات فرم حفظ شده‌اند.",
+    );
+  }
   let data;
   try {
     data = await response.json();
   } catch {
     throw new Error("پاسخ سرور معتبر نیست.");
   }
+  if (!response.ok && data.error?.code === "UNAUTHENTICATED")
+    window.dispatchEvent(new Event("relationship:unauthenticated"));
   if (!response.ok)
     throw new APIError(
       data.error?.message ?? "ارتباط با سرور برقرار نشد.",
@@ -101,6 +127,7 @@ export function contactAge(date?: string) {
 export const labels: Record<string, string> = {
   call: "تماس",
   message: "پیام",
+  sms: "پیامک",
   meeting: "جلسه",
   gift: "هدیه",
   flower: "گل",
@@ -119,3 +146,19 @@ export const labels: Record<string, string> = {
   processing: "در حال ارسال",
   retry_wait: "در انتظار تلاش مجدد",
 };
+
+export async function apiAll(route: string) {
+  let items: any[] = [],
+    cursor: string | null = null;
+  do {
+    const page: any = await api(
+      route +
+        (route.includes("?") ? "&" : "?") +
+        "limit=100" +
+        (cursor ? "&cursor=" + encodeURIComponent(cursor) : ""),
+    );
+    items.push(...page.items);
+    cursor = page.next_cursor ?? null;
+  } while (cursor);
+  return { items, next_cursor: null };
+}

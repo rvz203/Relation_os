@@ -1,6 +1,6 @@
 import { z } from "zod";
 import { DateTime, IANAZone } from "luxon";
-import { query, transaction, lockOwner } from "@/db";
+import { query, transaction, lockOwner, type DB } from "@/db";
 import {
   owned,
   checkVersion,
@@ -10,9 +10,10 @@ import {
   audit,
   text,
   uuid,
+  decrypt,
 } from "./core";
 import type { Owner } from "./auth";
-import { flowerSchedule } from "@/lib/calendar";
+import { flowerSchedule, zonedInstant, localToday } from "@/lib/calendar";
 export async function saveSettings(user: Owner, input: unknown) {
   const d = z
     .object({
@@ -21,6 +22,9 @@ export async function saveSettings(user: Owner, input: unknown) {
       florist_send_local_time: z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/),
       sms_enabled: z.boolean(),
       owner_mobile: text.optional(),
+      ui_calendar: z
+        .enum(["jalali", "gregorian"])
+        .default(user.ui_calendar ?? "jalali"),
     })
     .parse(input);
   if (!IANAZone.isValidZone(d.timezone)) fail("منطقه زمانی معتبر نیست.");
@@ -36,26 +40,56 @@ export async function saveSettings(user: Owner, input: unknown) {
         d.sms_enabled,
       ],
     );
+    await db.query("UPDATE users SET ui_calendar=$2 WHERE id=$1", [
+      user.id,
+      d.ui_calendar,
+    ]);
     if (d.owner_mobile !== undefined)
       await db.query(
         "UPDATE people SET mobile=$2,version=version+1 WHERE user_id=$1 AND is_self",
         [user.id, mobile(d.owner_mobile)],
       );
     if (d.timezone !== user.timezone) {
-      await db.query(
-        "UPDATE reminders SET scheduled_at=CASE WHEN scheduled_at IS NULL THEN NULL ELSE (scheduled_at AT TIME ZONE timezone) AT TIME ZONE $3 END,timezone=$3,version=version+1,updated_at=now() WHERE user_id=$1 AND timezone=$2 AND is_enabled",
-        [user.id, user.timezone, d.timezone],
+      const future = await query(
+        "SELECT * FROM reminders r WHERE user_id=$1 AND timezone=$2 AND is_enabled AND (schedule_mode='per_occurrence' OR (scheduled_at>now() AND NOT EXISTS(SELECT 1 FROM outbox_messages o WHERE o.user_id=r.user_id AND o.reminder_id=r.id AND o.state IN('processing','accepted','delivered','unknown'))))",
+        [user.id, user.timezone],
+        db,
       );
+      for (const r of future) {
+        const wall = r.scheduled_at
+          ? DateTime.fromJSDate(r.scheduled_at).setZone(r.timezone)
+          : null;
+        await db.query(
+          "UPDATE reminders SET timezone=$3,scheduled_at=$4,version=version+1,updated_at=now() WHERE user_id=$1 AND id=$2",
+          [
+            user.id,
+            r.id,
+            d.timezone,
+            wall
+              ? zonedInstant(
+                  wall.toISODate()!,
+                  wall.toFormat("HH:mm"),
+                  d.timezone,
+                )
+              : null,
+          ],
+        );
+      }
       await db.query(
         "UPDATE outbox_messages SET state='cancelled',error_code='TIMEZONE_CHANGED',updated_at=now() WHERE user_id=$1 AND reminder_id IN(SELECT id FROM reminders WHERE user_id=$1 AND timezone=$2) AND state IN('queued','retry_wait')",
         [user.id, d.timezone],
       );
     }
-    const flowers = await query(
-      "SELECT a.id,a.version,f.delivery_date FROM actions a JOIN flower_details f ON f.action_id=a.id AND f.user_id=a.user_id WHERE a.user_id=$1 AND a.status='pending'",
-      [user.id],
-      db,
-    );
+    const timingChanged =
+      d.timezone !== user.timezone ||
+      d.florist_send_local_time !== user.florist_send_local_time;
+    const flowers = timingChanged
+      ? await query(
+          "SELECT a.id,a.version,f.delivery_date,f.delivery_local_time FROM actions a JOIN flower_details f ON f.action_id=a.id AND f.user_id=a.user_id JOIN outbox_messages o ON o.user_id=a.user_id AND o.action_id=a.id WHERE a.user_id=$1 AND a.status='pending' AND f.sms_accepted_at IS NULL AND f.delivery_date>=$2 AND o.state IN('queued','retry_wait','cancelled','expired')",
+          [user.id, localToday(d.timezone)],
+          db,
+        )
+      : [];
     for (const f of flowers) {
       const s = flowerSchedule(
         f.delivery_date,
@@ -63,8 +97,24 @@ export async function saveSettings(user: Owner, input: unknown) {
         d.timezone,
       );
       await db.query(
-        "UPDATE outbox_messages SET scheduled_at=$3,deadline_at=$4,updated_at=now() WHERE user_id=$1 AND action_id=$2 AND state IN('queued','retry_wait')",
-        [user.id, f.id, s.scheduled_at, s.deadline_at],
+        "UPDATE actions SET due_at=$3,version=version+1,updated_at=now() WHERE user_id=$1 AND id=$2",
+        [
+          user.id,
+          f.id,
+          zonedInstant(
+            f.delivery_date,
+            f.delivery_local_time ?? "10:00",
+            d.timezone,
+          ),
+        ],
+      );
+      await db.query(
+        "UPDATE flower_details SET timezone=$3 WHERE user_id=$1 AND action_id=$2",
+        [user.id, f.id, d.timezone],
+      );
+      await db.query(
+        "UPDATE outbox_messages SET schedule_version=$5,preview_fingerprint=NULL,payload_snapshot=NULL,next_attempt_at=NULL,scheduled_at=$3,deadline_at=$4,state=CASE WHEN state='expired' AND $4::timestamptz>now() THEN 'queued' ELSE state END,updated_at=now() WHERE user_id=$1 AND action_id=$2 AND state IN('queued','retry_wait','cancelled','expired')",
+        [user.id, f.id, s.scheduled_at, s.deadline_at, f.version + 1],
       );
     }
     if (!d.sms_enabled)
@@ -78,7 +128,18 @@ export async function saveSettings(user: Owner, input: unknown) {
         [user.id],
       );
     await audit(db, user.id, "update", "settings", user.id, Object.keys(d));
-    return d;
+    const [started] = await query(
+      "SELECT count(*)::int n FROM outbox_messages WHERE user_id=$1 AND state IN('processing','accepted','delivered','unknown')",
+      [user.id],
+      db,
+    );
+    return {
+      ...d,
+      warning:
+        timingChanged && started.n
+          ? "تنظیمات فقط ارسال‌های آینده را تغییر داد؛ ارسال‌های آغازشده قابل بازپس‌گیری نیستند."
+          : null,
+    };
   });
 }
 export async function saveFlorist(user: string, input: unknown, id?: string) {
@@ -94,7 +155,11 @@ export async function saveFlorist(user: string, input: unknown, id?: string) {
         version: z.number().int().optional(),
       })
       .parse({ ...current, ...(input as object) });
-    if (current) checkVersion(current as { version: number }, d.version);
+    if (current)
+      checkVersion(
+        current as { version: number },
+        (input as { version?: number })?.version,
+      );
     const number = mobile(d.mobile);
     const [r] = id
       ? await query(
@@ -107,6 +172,11 @@ export async function saveFlorist(user: string, input: unknown, id?: string) {
           [user, d.name, number, d.notes ?? "", d.is_active],
           db,
         );
+    if (id)
+      await db.query(
+        "UPDATE florists SET archived_at=CASE WHEN is_active THEN NULL ELSE now() END WHERE user_id=$1 AND id=$2",
+        [user, id],
+      );
     if (id && !d.is_active) {
       await db.query(
         "UPDATE outbox_messages SET state='cancelled',error_code='FLORIST_INACTIVE',updated_at=now() WHERE user_id=$1 AND action_id IN(SELECT action_id FROM flower_details WHERE user_id=$1 AND florist_id=$2) AND state IN('queued','retry_wait')",
@@ -121,8 +191,13 @@ export async function saveFlorist(user: string, input: unknown, id?: string) {
     return r;
   });
 }
-export async function saveReminder(user: Owner, input: unknown, id?: string) {
-  return transaction(async (db) => {
+export async function saveReminder(
+  user: Owner,
+  input: unknown,
+  id?: string,
+  externalDb?: DB,
+) {
+  const work = async (db: DB) => {
     await lockOwner(db, user.id);
     const current = id ? await owned(db, "reminders", user.id, id) : null;
     const d = z
@@ -144,8 +219,23 @@ export async function saveReminder(user: Owner, input: unknown, id?: string) {
         is_enabled: z.boolean().default(true),
         version: z.number().int().optional(),
       })
-      .parse({ ...current, ...(input as object) });
-    if (current) checkVersion(current as { version: number }, d.version);
+      .parse({
+        ...current,
+        ...(current
+          ? {
+              message: decrypt(current.message),
+              scheduled_at: current.scheduled_at
+                ? new Date(current.scheduled_at).toISOString()
+                : null,
+            }
+          : {}),
+        ...(input as object),
+      });
+    if (current)
+      checkVersion(
+        current as { version: number },
+        (input as { version?: number })?.version,
+      );
     if (!IANAZone.isValidZone(d.timezone)) fail("منطقه زمانی معتبر نیست.");
     if (
       [d.person_id, d.action_id, d.important_date_id].filter(Boolean).length !==
@@ -159,10 +249,16 @@ export async function saveReminder(user: Owner, input: unknown, id?: string) {
       (!d.scheduled_at || !DateTime.fromISO(d.scheduled_at).isValid)
     )
       fail("زمان یادآوری الزامی است.");
+    if (d.channel === "in_app" && d.recipient_person_id)
+      fail("گیرنده اعلان داخل برنامه فقط حساب شما است.");
     if (d.person_id) await owned(db, "people", user.id, d.person_id, true);
     if (d.important_date_id)
       await owned(db, "important_dates", user.id, d.important_date_id, true);
-    if (d.action_id) await owned(db, "actions", user.id, d.action_id);
+    if (d.action_id) {
+      const a = await owned(db, "actions", user.id, d.action_id);
+      if (a.status !== "pending") fail("اقدام بسته‌شده یادآوری تازه ندارد.");
+      await owned(db, "people", user.id, a.person_id, true);
+    }
     if (d.recipient_person_id)
       await owned(db, "people", user.id, d.recipient_person_id, true);
     const vals = [
@@ -197,5 +293,6 @@ export async function saveReminder(user: Owner, input: unknown, id?: string) {
       );
     await audit(db, user.id, id ? "update" : "create", "reminder", r.id);
     return { ...r, message: d.message };
-  });
+  };
+  return externalDb ? work(externalDb) : transaction(work);
 }

@@ -9,7 +9,7 @@ if (!email || !password || password.length < 12)
   );
 await transaction(async (db) => {
   const [u] = await query(
-    "INSERT INTO users(email,password_hash,display_name) VALUES($1,$2,$3) RETURNING id",
+    "INSERT INTO users(email,password_hash,display_name,must_change_password) VALUES($1,$2,$3,true) RETURNING id",
     [email, passwordHash(password), name],
     db,
   );

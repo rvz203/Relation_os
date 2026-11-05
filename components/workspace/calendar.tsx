@@ -8,23 +8,34 @@ import { faDate } from "@/lib/calendar";
 import { Busy, Empty, ErrorBox } from "./common";
 export function CalendarView({
   zone,
+  calendar = "jalali",
   onPerson,
   onFlower,
   revision,
 }: {
   zone: string;
+  calendar?: string;
   onPerson: (id: string) => void;
   onFlower: (id: string, event?: any) => void;
   revision: number;
 }) {
   const today = DateTime.now().setZone(zone),
     j = jalaali.toJalaali(today.year, today.month, today.day);
-  const [month, setMonth] = useState({ year: j.jy, month: j.jm }),
+  const [month, setMonth] = useState({
+      year: calendar === "jalali" ? j.jy : today.year,
+      month: calendar === "jalali" ? j.jm : today.month,
+    }),
     [selected, setSelected] = useState(today.toISODate()!),
     [events, setEvents] = useState<any[] | null>(null),
     [error, setError] = useState<Error | null>(null);
-  const first = jalaali.toGregorian(month.year, month.month, 1),
-    length = jalaali.jalaaliMonthLength(month.year, month.month),
+  const first =
+      calendar === "jalali"
+        ? jalaali.toGregorian(month.year, month.month, 1)
+        : { gy: month.year, gm: month.month, gd: 1 },
+    length =
+      calendar === "jalali"
+        ? jalaali.jalaaliMonthLength(month.year, month.month)
+        : DateTime.utc(month.year, month.month).daysInMonth!,
     start = DateTime.utc(first.gy, first.gm, first.gd),
     end = start.plus({ days: length - 1 }),
     offset = (start.weekday + 1) % 7;
@@ -55,7 +66,10 @@ export function CalendarView({
       y--;
     }
     setMonth({ year: y, month: m });
-    const g = jalaali.toGregorian(y, m, 1);
+    const g =
+      calendar === "jalali"
+        ? jalaali.toGregorian(y, m, 1)
+        : { gy: y, gm: m, gd: 1 };
     setSelected(DateTime.utc(g.gy, g.gm, g.gd).toISODate()!);
   };
   return (
@@ -75,7 +89,10 @@ export function CalendarView({
             </button>
             <button
               onClick={() => {
-                setMonth({ year: j.jy, month: j.jm });
+                setMonth({
+                  year: calendar === "jalali" ? j.jy : today.year,
+                  month: calendar === "jalali" ? j.jm : today.month,
+                });
                 setSelected(today.toISODate()!);
               }}
             >
@@ -142,7 +159,10 @@ export function CalendarView({
             </button>
             <button
               onClick={() => {
-                setMonth({ year: j.jy, month: j.jm });
+                setMonth({
+                  year: calendar === "jalali" ? j.jy : today.year,
+                  month: calendar === "jalali" ? j.jm : today.month,
+                });
                 setSelected(today.toISODate()!);
               }}
             >

@@ -1,6 +1,7 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
 import { z } from "zod";
-import { query, transaction } from "@/db";
+import { applyDeliveryResult } from "./delivery";
+import { query, transaction, lockOwner } from "@/db";
 import { fail, audit } from "./core";
 export async function receiveSMSWebhook(
   raw: string,
@@ -18,6 +19,7 @@ export async function receiveSMSWebhook(
     .digest("hex");
   if (
     !signature ||
+    !/^[a-f0-9]{64}$/i.test(signature) ||
     signature.length !== expected.length ||
     !timingSafeEqual(Buffer.from(signature), Buffer.from(expected))
   )
@@ -35,30 +37,23 @@ export async function receiveSMSWebhook(
       status: z.enum(["accepted", "delivered", "failed"]),
     })
     .parse(parsed);
+  const [m] = await query(
+    "SELECT user_id,provider_message_id FROM outbox_messages WHERE id=$1",
+    [d.client_reference],
+  );
+  if (!m) return { ok: true };
   return transaction(async (db) => {
-    const [m] = await query(
-      "SELECT * FROM outbox_messages WHERE id=$1 FOR UPDATE",
-      [d.client_reference],
-      db,
-    );
-    if (!m || !["processing", "unknown", "accepted"].includes(m.state))
-      return { ok: true };
+    await lockOwner(db, m.user_id);
     if (
       m.provider_message_id &&
       d.provider_message_id &&
       m.provider_message_id !== d.provider_message_id
     )
       fail("Provider message mismatch.", 409);
-    await db.query(
-      "UPDATE outbox_messages SET state=$2,provider_message_id=coalesce(provider_message_id,$3),locked_until=NULL,updated_at=now() WHERE id=$1",
-      [m.id, d.status, d.provider_message_id ?? null],
-    );
-    if (m.action_id && ["accepted", "delivered"].includes(d.status))
-      await db.query(
-        "UPDATE flower_details SET sms_accepted_at=coalesce(sms_accepted_at,now()) WHERE user_id=$1 AND action_id=$2",
-        [m.user_id, m.action_id],
-      );
-    await audit(db, m.user_id, "provider_" + d.status, "message", m.id);
+    await applyDeliveryResult(db, m.user_id, d.client_reference, {
+      state: d.status,
+      provider_id: d.provider_message_id,
+    });
     return { ok: true };
   });
 }

@@ -1,6 +1,7 @@
 import { setTimeout } from "node:timers/promises";
 import { pool, query } from "../db/index";
 import { generateReminders, processOneMessage } from "../lib/server/messaging";
+import { processPendingImport } from "../lib/server/imports";
 let stopping = false;
 process.on("SIGINT", () => {
   stopping = true;
@@ -11,6 +12,7 @@ process.on("SIGTERM", () => {
 const once = process.argv.includes("--once");
 do {
   try {
+    await processPendingImport();
     await generateReminders();
     for (let i = 0; i < 100 && !stopping; i++) {
       if (!(await processOneMessage())) break;

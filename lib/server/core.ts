@@ -7,6 +7,9 @@ import {
   timingSafeEqual,
 } from "node:crypto";
 import { z } from "zod";
+import { AsyncLocalStorage } from "node:async_hooks";
+import { randomUUID } from "node:crypto";
+import { DateTime } from "luxon";
 import { query, type DB } from "@/db";
 
 export class AppError extends Error {
@@ -19,6 +22,7 @@ export class AppError extends Error {
     super(message);
   }
 }
+export const auditContext = new AsyncLocalStorage<{ requestId: string }>();
 export function fail(
   message: string,
   status = 422,
@@ -100,8 +104,15 @@ export async function audit(
   fields: string[] = [],
 ) {
   await db.query(
-    "INSERT INTO audit_logs(user_id,event,entity_type,entity_id,changed_fields) VALUES($1,$2,$3,$4,$5)",
-    [user, event, entity, id ?? null, fields],
+    "INSERT INTO audit_logs(user_id,event,entity_type,entity_id,changed_fields,actor_user_id,request_id) VALUES($1,$2,$3,$4,$5,$1,$6)",
+    [
+      user,
+      event,
+      entity,
+      id ?? null,
+      fields,
+      auditContext.getStore()?.requestId ?? randomUUID(),
+    ],
   );
 }
 export const uuid = z.string().uuid();
@@ -125,6 +136,8 @@ export function checkVersion(
   row: { version: number },
   version: number | undefined,
 ) {
+  if (version === undefined)
+    fail("نسخه رکورد برای ویرایش الزامی است.", 422, "VERSION_REQUIRED");
   if (row.version !== version)
     fail(
       "اطلاعات تغییر کرده است. فرم شما حفظ شد؛ اطلاعات تازه را بارگذاری کنید.",
@@ -133,8 +146,16 @@ export function checkVersion(
     );
 }
 export const text = z.string().trim().max(10000);
+export const isoDay = z
+  .string()
+  .regex(/^\d{4}-\d{2}-\d{2}$/)
+  .refine(
+    (s) => DateTime.fromISO(s, { zone: "UTC" }).isValid,
+    "تاریخ معتبر نیست.",
+  );
+export const localTime = z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/);
 export const personSchema = z.object({
-  display_name: z.string().trim().min(1).max(200),
+  display_name: z.string().trim().max(200).optional(),
   first_name: z.string().trim().max(100).optional(),
   last_name: text.optional(),
   mobile: text.nullish(),
@@ -145,6 +166,16 @@ export const personSchema = z.object({
   address: text.optional(),
   notes: text.optional(),
   private_notes: text.optional(),
+  gender: text.nullish(),
+  country_code: z
+    .union([z.string().regex(/^[A-Z]{2}$/), z.literal("")])
+    .nullish(),
+  industry: text.nullish(),
+  activity_area: text.nullish(),
+  first_met_on: isoDay.nullish(),
+  acquaintance_notes: text.optional(),
+  expertise: z.array(z.string().trim().min(1).max(80)).max(30).optional(),
+  labels: z.array(z.string().trim().min(1).max(80)).max(30).optional(),
   importance_level: z.enum(["A", "B", "C"]).default("B"),
   introduction_source: z
     .enum(["direct", "person", "unknown"])
@@ -164,6 +195,7 @@ export const dateSchema = z.object({
   recurrence: z.enum(["none", "yearly"]).default("yearly"),
   leap_policy: z.enum(["last_valid_day", "skip"]).default("last_valid_day"),
   version: z.number().int().optional(),
+  notes: text.optional(),
 });
 export const flowerSchema = z.object({
   florist_id: uuid,
@@ -172,6 +204,8 @@ export const flowerSchema = z.object({
   delivery_date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
   delivery_address: text.min(1),
   card_message: text.default(""),
+  delivery_local_time: localTime.nullish(),
+  notes: text.optional(),
 });
 export const actionSchema = z.object({
   person_id: uuid,
@@ -184,7 +218,8 @@ export const actionSchema = z.object({
     "reminder",
     "custom",
   ]),
-  title: text.min(1),
+  title: text.min(1).optional(),
+  custom_title: text.min(1).optional(),
   due_at: z.string().datetime({ offset: true }),
   important_date_id: uuid.nullish(),
   occurrence_date: z
@@ -194,4 +229,5 @@ export const actionSchema = z.object({
   notes: text.optional(),
   flower: flowerSchema.optional(),
   version: z.number().int().optional(),
+  reminder_at: z.string().datetime({ offset: true }).nullish(),
 });

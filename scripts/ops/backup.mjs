@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { mkdir, unlink } from "node:fs/promises";
+import { mkdir, unlink, readdir, stat } from "node:fs/promises";
 import { createWriteStream } from "node:fs";
 import path from "node:path";
 import { pipeline } from "node:stream/promises";
@@ -37,6 +37,17 @@ try {
     exit(cipher),
   ]);
   console.log("Encrypted backup created:", file);
+  const retentionDays = Math.max(
+    30,
+    Number(process.env.BACKUP_RETENTION_DAYS) || 30,
+  );
+  for (const name of await readdir(directory))
+    if (/^relationship-os-[0-9T-]+Z\.dump\.enc$/.test(name)) {
+      const previous = path.join(directory, name);
+      const info = await stat(previous);
+      if (info.isFile() && Date.now() - info.mtimeMs > retentionDays * 86400000)
+        await unlink(previous);
+    }
 } catch (error) {
   dump.kill();
   cipher.kill();

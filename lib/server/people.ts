@@ -17,6 +17,7 @@ export function publicPerson(p: Record<string, any>): Record<string, any> {
     address: decrypt(p.address),
     notes: decrypt(p.notes),
     private_notes: decrypt(p.private_notes),
+    acquaintance_notes: decrypt(p.acquaintance_notes),
     tags: p.tags ?? [],
   };
 }
@@ -25,27 +26,33 @@ export async function listPeople(
   params: URLSearchParams,
   db: DB = pool,
 ) {
-  const limit = Math.min(100, Math.max(1, Number(params.get("limit")) || 30));
+  const limit = Math.min(
+    100,
+    Math.max(1, Math.floor(Number(params.get("limit")) || 30)),
+  );
   const q = normalize(params.get("q") ?? ""),
     importance = params.get("importance"),
     cursor = params.get("cursor"),
     tag = params.get("tag");
+  const tagId = params.get("tag_id");
+  if (tagId) (await import("./core")).uuid.parse(tagId);
   const rows = await query(
     `SELECT p.*,coalesce((SELECT jsonb_agg(t.name ORDER BY t.name) FROM person_tags pt JOIN tags t ON t.id=pt.tag_id AND t.user_id=pt.user_id WHERE pt.person_id=p.id AND pt.user_id=p.user_id),'[]') tags,
     (SELECT max(i.occurred_at) FROM interactions i WHERE i.user_id=p.user_id AND i.person_id=p.id AND counts_as_contact) last_interaction_at,
     (SELECT min(a.due_at) FROM actions a WHERE a.user_id=p.user_id AND a.person_id=p.id AND a.status='pending') next_action_at,
     intro.display_name introduced_by_name FROM people p LEFT JOIN people intro ON intro.id=p.introduced_by_person_id AND intro.user_id=p.user_id
-    WHERE p.user_id=$1 AND p.is_active=$2 AND NOT p.is_self AND ($3='' OR position($3 in p.normalized_search)>0 OR EXISTS(SELECT 1 FROM person_tags pt JOIN tags t ON t.id=pt.tag_id AND t.user_id=pt.user_id WHERE pt.person_id=p.id AND pt.user_id=p.user_id AND position($3 in t.normalized_name)>0))
+    WHERE p.user_id=$1 AND p.is_active=$2 AND NOT p.is_self AND ($3='' OR p.normalized_search LIKE '%'||$3||'%' ESCAPE '!' OR EXISTS(SELECT 1 FROM person_tags pt JOIN tags t ON t.id=pt.tag_id AND t.user_id=pt.user_id WHERE pt.person_id=p.id AND pt.user_id=p.user_id AND t.normalized_name LIKE '%'||$3||'%' ESCAPE '!'))
     AND ($4::text IS NULL OR p.importance_level=$4) AND ($5::uuid IS NULL OR p.id>$5)
-    AND ($6::text IS NULL OR EXISTS(SELECT 1 FROM person_tags pt JOIN tags t ON t.id=pt.tag_id AND t.user_id=pt.user_id WHERE pt.person_id=p.id AND pt.user_id=p.user_id AND t.name=$6)) ORDER BY p.id LIMIT $7`,
+    AND ($6::text IS NULL OR EXISTS(SELECT 1 FROM person_tags pt JOIN tags t ON t.id=pt.tag_id AND t.user_id=pt.user_id WHERE pt.person_id=p.id AND pt.user_id=p.user_id AND t.name=$6)) AND ($8::uuid IS NULL OR EXISTS(SELECT 1 FROM person_tags pt WHERE pt.user_id=p.user_id AND pt.person_id=p.id AND pt.tag_id=$8)) ORDER BY p.id LIMIT $7`,
     [
       user,
       params.get("active") !== "false",
-      q,
+      q.replace(/[!%_]/g, (c) => "!" + c),
       importance && importance !== "all" ? importance : null,
       cursor,
       tag,
       limit + 1,
+      tagId,
     ],
     db,
   );
@@ -57,34 +64,50 @@ export async function listPeople(
 }
 export async function personDetail(user: string, id: string, db: DB = pool) {
   const p = await owned(db, "people", user, id);
-  p.tags = (
-    await query(
-      "SELECT t.name FROM tags t JOIN person_tags pt ON pt.tag_id=t.id AND pt.user_id=t.user_id WHERE pt.user_id=$1 AND pt.person_id=$2",
-      [user, id],
-      db,
-    )
-  ).map((t) => t.name);
+  p.tag_objects = await query(
+    "SELECT t.id,t.name,t.kind FROM tags t JOIN person_tags pt ON pt.tag_id=t.id AND pt.user_id=t.user_id WHERE pt.user_id=$1 AND pt.person_id=$2",
+    [user, id],
+    db,
+  );
+  p.tags = p.tag_objects.map((t: any) => t.name);
+  p.expertise = p.tag_objects
+    .filter((t: any) => t.kind === "expertise")
+    .map((t: any) => t.name);
+  p.labels = p.tag_objects
+    .filter((t: any) => t.kind === "label")
+    .map((t: any) => t.name);
   const [interaction] = await query(
     "SELECT max(occurred_at) last_interaction_at FROM interactions WHERE user_id=$1 AND person_id=$2 AND counts_as_contact",
     [user, id],
     db,
   );
-  return publicPerson({ ...p, ...interaction });
+  const [next] = await query(
+    "SELECT id,title,due_at,action_type FROM actions WHERE user_id=$1 AND person_id=$2 AND status='pending' ORDER BY due_at,id LIMIT 1",
+    [user, id],
+    db,
+  );
+  return publicPerson({ ...p, ...interaction, next_action: next ?? null });
 }
 export async function setTags(
   db: DB,
   user: string,
   id: string,
-  tags: string[],
+  tags: (string | { name: string; kind: string })[],
 ) {
   await db.query("DELETE FROM person_tags WHERE user_id=$1 AND person_id=$2", [
     user,
     id,
   ]);
-  for (const name of [...new Set(tags.map((t) => t.trim()).filter(Boolean))]) {
+  const seen = new Set<string>();
+  for (const input of tags) {
+    const name = (typeof input === "string" ? input : input.name).trim(),
+      kind = typeof input === "string" ? "expertise" : input.kind;
+    const key = kind + ":" + normalize(name);
+    if (!name || seen.has(key)) continue;
+    seen.add(key);
     const [tag] = await query(
-      `INSERT INTO tags(user_id,name,normalized_name) VALUES($1,$2,$3) ON CONFLICT(user_id,normalized_name,kind) DO UPDATE SET is_active=true RETURNING id`,
-      [user, name, normalize(name)],
+      `INSERT INTO tags(user_id,name,normalized_name,kind) VALUES($1,$2,$3,$4) ON CONFLICT(user_id,normalized_name,kind) DO UPDATE SET is_active=true RETURNING id`,
+      [user, name, normalize(name), kind],
       db,
     );
     await db.query(
@@ -122,14 +145,17 @@ export async function savePerson(
   id?: string,
   externalDb?: DB,
 ) {
-  const run = async (db: DB) => {
+  const run = async (db: DB): Promise<Record<string, any>> => {
     await lockOwner(db, user);
     const current = id ? await personDetail(user, id, db) : undefined;
     const d = personSchema.parse(
       current ? { ...current, ...(input as object) } : input,
     );
     if (current) {
-      checkVersion(current as { version: number }, d.version);
+      checkVersion(
+        current as { version: number },
+        (input as { version?: number })?.version,
+      );
       if (current.is_self) fail("پروفایل مرکزی از این فرم ویرایش نمی‌شود.");
     }
     const parent =
@@ -137,15 +163,27 @@ export async function savePerson(
     if (d.introduction_source === "person" && !parent)
       fail("معرفی‌کننده را انتخاب کنید.");
     await checkIntroduction(db, user, id, parent);
+    const displayName =
+      d.display_name || [d.first_name, d.last_name].filter(Boolean).join(" ");
+    if (!displayName) fail("نام الزامی است.");
+    const firstName = d.first_name || displayName.split(" ")[0];
+    if (firstName.length > 100) fail("نام کوچک حداکثر ۱۰۰ نویسه است.");
     const phone = mobile(d.mobile);
     const values = [
-      d.first_name || d.display_name.split(" ")[0],
+      firstName,
       d.last_name || "",
-      d.display_name,
+      displayName,
       normalize(
-        [d.display_name, phone, d.email, d.company, d.job_title, d.city].join(
-          " ",
-        ),
+        [
+          displayName,
+          phone,
+          d.email,
+          d.company,
+          d.job_title,
+          d.city,
+          d.industry,
+          d.activity_area,
+        ].join(" "),
       ),
       phone,
       d.email || null,
@@ -172,7 +210,41 @@ export async function savePerson(
         [user, ...values],
         db,
       );
-    await setTags(db, user, person.id, d.tags);
+    await db.query(
+      "UPDATE people SET gender=$3,country_code=$4,industry=$5,activity_area=$6,first_met_on=$7,acquaintance_notes=$8 WHERE user_id=$1 AND id=$2",
+      [
+        user,
+        person.id,
+        d.gender ?? "",
+        d.country_code || null,
+        d.industry ?? "",
+        d.activity_area ?? "",
+        d.first_met_on ?? null,
+        encrypt(d.acquaintance_notes),
+      ],
+    );
+    const supplied = input as Record<string, unknown>;
+    let tagValues: (string | { name: string; kind: string })[] = d.tags;
+    if ("expertise" in supplied || "labels" in supplied)
+      tagValues = [
+        ...(d.expertise ?? current?.expertise ?? []).map((name: string) => ({
+          name,
+          kind: "expertise",
+        })),
+        ...(d.labels ?? current?.labels ?? []).map((name: string) => ({
+          name,
+          kind: "label",
+        })),
+      ];
+    else
+      tagValues = d.tags.map((name) => ({
+        name,
+        kind:
+          current?.tag_objects?.find(
+            (t: any) => normalize(t.name) === normalize(name),
+          )?.kind ?? "expertise",
+      }));
+    await setTags(db, user, person.id, tagValues);
     await audit(
       db,
       user,
@@ -181,7 +253,18 @@ export async function savePerson(
       person.id,
       Object.keys(d),
     );
-    return personDetail(user, person.id, db);
+    const result = await personDetail(user, person.id, db);
+    const [similar] = await query(
+      "SELECT count(*)::int n FROM people WHERE user_id=$1 AND id<>$2 AND is_active AND mobile=$3",
+      [user, person.id, phone],
+      db,
+    );
+    return {
+      ...result,
+      warnings: similar.n
+        ? ["شماره موبایل با فرد دیگری مشترک است؛ هیچ ادغامی انجام نشد."]
+        : [],
+    };
   };
   return externalDb ? run(externalDb) : transaction(run);
 }

@@ -1,12 +1,14 @@
 import { z } from "zod";
 import { pool, query, transaction, lockOwner, type DB } from "@/db";
-import { audit, checkVersion, fail, owned, text, uuid } from "./core";
+import { audit, checkVersion, fail, owned, text, uuid, isoDay } from "./core";
 export const relationshipSchema = z.object({
   person_a_id: uuid,
   person_b_id: uuid,
   relationship_type_id: uuid,
   notes: text.optional(),
   version: z.number().int().optional(),
+  introduced_by_person_id: uuid.nullish(),
+  start_date: isoDay.nullish(),
 });
 export async function saveRelationship(
   user: string,
@@ -18,7 +20,11 @@ export async function saveRelationship(
     await lockOwner(db, user);
     const current = id ? await owned(db, "relationships", user, id) : null;
     const d = relationshipSchema.parse({ ...current, ...(input as object) });
-    if (current) checkVersion(current as { version: number }, d.version);
+    if (current)
+      checkVersion(
+        current as { version: number },
+        (input as { version?: number })?.version,
+      );
     const type = await owned(
       db,
       "relationship_types",
@@ -28,6 +34,8 @@ export async function saveRelationship(
     );
     await owned(db, "people", user, d.person_a_id, true);
     await owned(db, "people", user, d.person_b_id, true);
+    if (d.introduced_by_person_id)
+      await owned(db, "people", user, d.introduced_by_person_id, true);
     if (d.person_a_id === d.person_b_id) fail("رابطه با خود مجاز نیست.");
     let a = d.person_a_id,
       b = d.person_b_id;
@@ -43,8 +51,13 @@ export async function saveRelationship(
           [user, a, b, d.relationship_type_id, d.notes ?? ""],
           db,
         );
+    const [saved] = await query(
+      "UPDATE relationships SET introduced_by_person_id=$3,start_date=$4 WHERE user_id=$1 AND id=$2 RETURNING *",
+      [user, r.id, d.introduced_by_person_id ?? null, d.start_date ?? null],
+      db,
+    );
     await audit(db, user, id ? "update" : "create", "relationship", r.id);
-    return r;
+    return saved;
   };
   return externalDb ? run(externalDb) : transaction(run);
 }
@@ -60,40 +73,51 @@ export async function relationships(
   );
 }
 export async function network(user: string, params: URLSearchParams) {
-  const center = params.get("center_person_id");
   const [self] = await query(
     "SELECT id FROM people WHERE user_id=$1 AND is_self",
     [user],
   );
-  const root = center ?? self?.id;
+  const root = params.get("center_person_id") ?? self?.id;
   if (!root) return { nodes: [], edges: [], truncated: false, has_more: false };
   await owned(pool, "people", user, root, true);
-  const depth = Math.min(2, Math.max(1, Number(params.get("depth")) || 1)),
-    limit = Math.min(200, Math.max(1, Number(params.get("limit")) || 200));
-  const rows = await query(
-    `WITH RECURSIVE edges AS (
-    SELECT person_a_id a,person_b_id b FROM relationships WHERE user_id=$1 AND archived_at IS NULL
-    UNION SELECT p.id,coalesce(p.introduced_by_person_id,$2) FROM people p WHERE p.user_id=$1 AND NOT p.is_self AND p.is_active AND p.introduction_source<>'unknown'
-  ), walk AS (SELECT $3::uuid id,0 depth UNION SELECT CASE WHEN e.a=w.id THEN e.b ELSE e.a END,w.depth+1 FROM walk w JOIN edges e ON e.a=w.id OR e.b=w.id WHERE w.depth<$4)
-  SELECT DISTINCT p.id,p.display_name,p.company,p.job_title,p.importance_level,p.introduced_by_person_id,p.introduction_source,p.is_self,p.photo_key FROM people p JOIN walk w ON w.id=p.id WHERE p.user_id=$1 AND p.is_active ORDER BY p.id LIMIT $5`,
-    [user, self?.id ?? root, root, depth, limit + 1],
+  const depth = Math.min(
+      2,
+      Math.max(1, Math.floor(Number(params.get("depth")) || 1)),
+    ),
+    limit = Math.min(
+      200,
+      Math.max(1, Math.floor(Number(params.get("limit")) || 200)),
+    );
+  const seen = new Set<string>([root]);
+  let frontier = [root],
+    truncated = false;
+  const adjacentSQL = `SELECT CASE WHEN r.person_a_id=ANY($2::uuid[]) THEN r.person_b_id ELSE r.person_a_id END id FROM relationships r JOIN people a ON a.user_id=r.user_id AND a.id=r.person_a_id AND a.is_active JOIN people b ON b.user_id=r.user_id AND b.id=r.person_b_id AND b.is_active WHERE r.user_id=$1 AND r.archived_at IS NULL AND (r.person_a_id=ANY($2::uuid[]) OR r.person_b_id=ANY($2::uuid[]))
+    UNION SELECT p.id FROM people p WHERE p.user_id=$1 AND p.is_active AND NOT p.is_self AND (p.introduced_by_person_id=ANY($2::uuid[]) OR (p.introduction_source='direct' AND $3::uuid=ANY($2::uuid[])))
+    UNION SELECT coalesce(p.introduced_by_person_id,$3) FROM people p WHERE p.user_id=$1 AND p.is_active AND NOT p.is_self AND p.introduction_source<>'unknown' AND p.id=ANY($2::uuid[])`;
+  for (let step = 0; step < depth && frontier.length; step++) {
+    const candidates = await query(
+      `SELECT DISTINCT p.id FROM (${adjacentSQL}) n JOIN people p ON p.id=n.id AND p.user_id=$1 AND p.is_active WHERE NOT(p.id=ANY($4::uuid[])) ORDER BY p.id LIMIT $5`,
+      [user, frontier, self?.id ?? root, [...seen], limit - seen.size + 1],
+    );
+    const available = limit - seen.size;
+    if (candidates.length > available) truncated = true;
+    frontier = candidates.slice(0, available).map((n) => n.id);
+    for (const id of frontier) seen.add(id);
+    if (truncated) break;
+  }
+  const ids = [...seen];
+  const nodes = await query(
+    "SELECT id,display_name,company,job_title,importance_level,introduced_by_person_id,introduction_source,is_self,photo_key FROM people WHERE user_id=$1 AND id=ANY($2::uuid[]) ORDER BY (id=$3) DESC,id",
+    [user, ids, root],
   );
-  const nodes = rows.slice(0, limit),
-    ids = new Set(nodes.map((n) => n.id));
-  const edges = (await relationships(user))
-    .filter((r) => ids.has(r.person_a_id) && ids.has(r.person_b_id))
-    .map((r) => ({
-      id: r.id,
-      source: r.person_a_id,
-      target: r.person_b_id,
-      label: r.label,
-      directed: r.is_directed,
-      kind: "relationship",
-    }));
+  const edges = await query(
+    `SELECT r.id,r.person_a_id source,r.person_b_id target,t.label,t.is_directed directed,'relationship' kind FROM relationships r JOIN relationship_types t ON t.user_id=r.user_id AND t.id=r.relationship_type_id WHERE r.user_id=$1 AND r.archived_at IS NULL AND r.person_a_id=ANY($2::uuid[]) AND r.person_b_id=ANY($2::uuid[])`,
+    [user, ids],
+  );
   for (const n of nodes) {
     const parent =
       n.introduction_source === "direct" ? self?.id : n.introduced_by_person_id;
-    if (!n.is_self && parent && ids.has(parent))
+    if (!n.is_self && parent && seen.has(parent))
       edges.push({
         id: "intro-" + n.id,
         source: parent,
@@ -104,14 +128,14 @@ export async function network(user: string, params: URLSearchParams) {
       });
   }
   const [more] = await query(
-    "SELECT count(*)::int total FROM people WHERE user_id=$1 AND is_active",
-    [user],
+    `SELECT EXISTS(SELECT 1 FROM (${adjacentSQL}) n JOIN people p ON p.id=n.id AND p.user_id=$1 AND p.is_active WHERE NOT(p.id=ANY($2::uuid[]))) more`,
+    [user, ids, self?.id ?? root],
   );
   return {
     nodes,
     edges,
     center_person_id: root,
-    truncated: rows.length > limit,
-    has_more: more.total > nodes.length,
+    truncated,
+    has_more: truncated || more.more,
   };
 }

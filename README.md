@@ -98,3 +98,7 @@ docker compose up --build -d
 ```
 
 Create the production owner inside the app container using `npm run owner:create` and environment variables. Put HTTPS in front of the app and set `APP_ORIGIN` to that HTTPS origin. A Node-compatible host with a PostgreSQL database and a persistent worker is required. Deployment credentials and a real SMS provider have not been supplied, so public hosting and live SMS are pending configuration.
+
+## Specification review
+
+The 5 November review and AC01–AC15/T01–T09 matrix are in [docs/SPECIFICATION_REVIEW.md](docs/SPECIFICATION_REVIEW.md). Run `npm test`, `npm run test:integration`, `npm run test:performance` and `npm run test:recovery` against local synthetic/sandbox environments; performance expects a running production server and uses `APP_ORIGIN`. Integration tests require a running app with the same origin. `npm run monitor` runs the independent incident monitor. Production provider, hosting, operations destinations and owner UAT remain deployment dependencies.

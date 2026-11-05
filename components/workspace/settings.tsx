@@ -2,7 +2,7 @@
 import { useEffect, useState } from "react";
 import { Check, Download, Flower2, Upload, RefreshCw } from "lucide-react";
 import { toast } from "sonner";
-import { api, fa, labels, type User } from "@/lib/client";
+import { api, apiAll, fa, labels, type User } from "@/lib/client";
 import { faDate } from "@/lib/calendar";
 import { Busy, Empty, ErrorBox, PersonPicker } from "./common";
 import type { Workflow } from "./workflow-modal";
@@ -10,7 +10,26 @@ export function ImportPanel({ onChanged }: { onChanged: () => void }) {
   const [job, setJob] = useState<any>(null),
     [busy, setBusy] = useState(false),
     [error, setError] = useState<Error | null>(null),
-    [page, setPage] = useState(0);
+    [page, setPage] = useState(0),
+    [allowDuplicate, setAllowDuplicate] = useState(false);
+  const locked = busy || ["queued", "processing"].includes(job?.status);
+  useEffect(() => {
+    if (!job || !["queued", "processing"].includes(job.status)) return;
+    const timer = setInterval(
+      () =>
+        api("imports/" + job.id)
+          .then((next) => {
+            setJob(next);
+            if (next.status === "committed") {
+              onChanged();
+              toast.success("ورود اطلاعات ثبت شد.");
+            }
+          })
+          .catch(setError),
+      1500,
+    );
+    return () => clearInterval(timer);
+  }, [job?.id, job?.status, onChanged]);
   const load = async (id: string) => setJob(await api("imports/" + id));
   const run = async (work: () => Promise<void>) => {
     setBusy(true);
@@ -44,19 +63,28 @@ export function ImportPanel({ onChanged }: { onChanged: () => void }) {
         CSV با UTF-8 یا XLSX بدون فرمول؛ حداکثر ۵ مگابایت و ۵۰۰۰ ردیف. ابتدا
         پیش‌نمایش را بررسی و سپس ثبت نهایی کنید.
       </p>
+      <label className="check-label">
+        <input
+          type="checkbox"
+          checked={allowDuplicate}
+          onChange={(e) => setAllowDuplicate(e.target.checked)}
+        />
+        ورود دوباره عمدی فایل یکسان
+      </label>
       <label className="file-input-label">
         انتخاب فایل
         <input
           aria-label="فایل ورود افراد"
           type="file"
           accept=".csv,.xlsx"
-          disabled={busy}
+          disabled={locked}
           onChange={(e) => {
             const file = e.target.files?.[0];
             if (file)
               run(async () => {
                 const form = new FormData();
                 form.set("file", file);
+                if (allowDuplicate) form.set("allow_duplicate", "true");
                 const result = await api("imports/people", "POST", form);
                 await load(result.job_id);
                 setPage(0);
@@ -89,8 +117,17 @@ export function ImportPanel({ onChanged }: { onChanged: () => void }) {
               {fa(job.result.created)} فرد جدید، {fa(job.result.linked)} اتصال،{" "}
               {fa(job.result.skipped)} سطر نادیده گرفته‌شده.
             </div>
+          ) : ["queued", "processing"].includes(job.status) ? (
+            <div className="soft-notice" role="status">
+              در صف پردازش؛ پس از ثبت نهایی نتیجه خودکار نمایش داده می‌شود.
+            </div>
           ) : (
             <>
+              {job.error_message && (
+                <div className="error-box" role="alert">
+                  {job.error_message}
+                </div>
+              )}
               <details>
                 <summary>نگاشت ستون‌ها</summary>
                 <div className="mapping-grid">
@@ -110,7 +147,7 @@ export function ImportPanel({ onChanged }: { onChanged: () => void }) {
                     <label key={field}>
                       <span dir="ltr">{field}</span>
                       <select
-                        disabled={busy}
+                        disabled={locked}
                         value={
                           job.mapping[field] ??
                           (job.headers.includes(field) ? field : "")
@@ -133,6 +170,37 @@ export function ImportPanel({ onChanged }: { onChanged: () => void }) {
                   ))}
                 </div>
               </details>
+              <details>
+                <summary>نگاشت معرفی‌کننده خارج از فایل</summary>
+                {[
+                  ...new Set<string>(
+                    job.rows
+                      .map((r: any) => r.data.introduced_by_external_id)
+                      .filter(
+                        (ref: string) =>
+                          ref &&
+                          !ref.startsWith("@") &&
+                          !job.rows.some(
+                            (r: any) => r.data.external_id === ref,
+                          ),
+                      ),
+                  ),
+                ].map((ref) => (
+                  <PersonPicker
+                    key={ref}
+                    label={"شناسه " + ref}
+                    value={job.external_references?.[ref] ?? ""}
+                    onChange={(id) =>
+                      update({
+                        external_references: {
+                          ...job.external_references,
+                          [ref]: id,
+                        },
+                      })
+                    }
+                  />
+                ))}
+              </details>
               <div className="import-rows">
                 {job.rows.slice(page * 25, (page + 1) * 25).map((row: any) => (
                   <div className="import-row" key={row.row_number}>
@@ -142,6 +210,15 @@ export function ImportPanel({ onChanged }: { onChanged: () => void }) {
                         {row.data.person_name || "بدون نام"}
                       </strong>
                       <small>{row.errors.join(" ") || "آماده ثبت"}</small>
+                      <small>
+                        معرفی‌کننده:{" "}
+                        {row.data.parent ||
+                          row.data.introduced_by_external_id ||
+                          "نامشخص"}{" "}
+                        · رابطه: {row.data.relationship_type || "فقط معرفی"} ·
+                        تخصص: {row.data.expertise || "—"} · برچسب:{" "}
+                        {row.data.tags || "—"}
+                      </small>
                       {row.similar.length > 0 && (
                         <small>
                           افراد مشابه:{" "}
@@ -153,7 +230,7 @@ export function ImportPanel({ onChanged }: { onChanged: () => void }) {
                     </div>
                     <select
                       aria-label={"تصمیم سطر " + row.row_number}
-                      disabled={busy}
+                      disabled={locked}
                       value={
                         row.decision.confirmed ? row.decision.operation : ""
                       }
@@ -222,15 +299,14 @@ export function ImportPanel({ onChanged }: { onChanged: () => void }) {
               <div className="form-footer">
                 <button
                   className="primary"
-                  disabled={!job.valid || busy}
+                  disabled={!job.valid || locked}
                   onClick={() =>
                     run(async () => {
                       await api("imports/" + job.id + "/commit", "POST", {
                         checksum: job.checksum,
                       });
                       await load(job.id);
-                      onChanged();
-                      toast.success("ورود اطلاعات ثبت شد.");
+                      toast.info("درخواست در صف پردازش قرار گرفت.");
                     })
                   }
                 >
@@ -244,7 +320,7 @@ export function ImportPanel({ onChanged }: { onChanged: () => void }) {
                 </button>
                 <button
                   className="secondary"
-                  disabled={busy}
+                  disabled={locked}
                   onClick={() =>
                     run(async () => {
                       await api("imports/" + job.id + "/validate", "POST", {});
@@ -281,25 +357,29 @@ export function SettingsView({
   onChanged: () => void;
   onWorkflow: (w: Workflow) => void;
 }) {
+  const [selectedMessage, setSelectedMessage] = useState<any>(null);
   const [data, setData] = useState<any>(null),
     [error, setError] = useState<Error | null>(null),
     [saving, setSaving] = useState(false);
   useEffect(() => {
     let alive = true;
     Promise.all([
-      api("florists"),
+      apiAll("florists"),
       api("messages"),
-      api("reminders"),
+      apiAll("reminders"),
       api("settings"),
+      api("operations"),
     ])
       .then(
-        ([f, m, r, s]) =>
+        ([f, m, r, s, ops]) =>
           alive &&
           setData({
             florists: f.items,
             messages: m.items,
             reminders: r.items,
             settings: s,
+            operations: ops,
+            messageCursor: m.next_cursor,
           }),
       )
       .catch((e) => alive && setError(e));
@@ -370,6 +450,16 @@ export function SettingsView({
             </label>
           </div>
           <label>
+            تقویم نمایش
+            <select
+              name="ui_calendar"
+              defaultValue={user.ui_calendar ?? "jalali"}
+            >
+              <option value="jalali">هجری شمسی</option>
+              <option value="gregorian">میلادی</option>
+            </select>
+          </label>
+          <label>
             شماره موبایل خودم <small>برای یادآوری پیامکی به خودتان</small>
             <input
               name="owner_mobile"
@@ -429,6 +519,41 @@ export function SettingsView({
           <Empty title="گلفروشی ثبت نشده" />
         )}
       </section>
+      <section className="panel settings-panel">
+        <div className="section-head">
+          <h2>سلامت زمان‌بندی</h2>
+        </div>
+        {data?.operations ? (
+          <div className="monitor-summary">
+            <p>
+              وضعیت پردازشگر:{" "}
+              {data.operations.worker_age_seconds !== null &&
+              data.operations.worker_age_seconds <= 600
+                ? "فعال"
+                : "نیاز به بررسی"}
+            </p>
+            <p>
+              قدیمی‌ترین پیام آماده: {fa(data.operations.queue_age_seconds)}{" "}
+              ثانیه
+            </p>
+            <p>
+              پیام نامشخص: {fa(data.operations.unknown)} · ناموفق:{" "}
+              {fa(data.operations.failed)}
+            </p>
+            <p>خطاهای اخیر API: {fa(data.operations.api_errors_recent ?? 0)}</p>
+            <p>
+              {data.operations.credit_status === "sandbox"
+                ? "پیامک آزمایشی؛ اعتبار مالی مصرف نمی‌شود."
+                : data.operations.sms_balance !== null
+                  ? "اعتبار پیامک: " + fa(data.operations.sms_balance)
+                  : "استعلام اعتبار درگاه پیامک تنظیم نشده است."}
+            </p>
+          </div>
+        ) : (
+          <Busy />
+        )}
+      </section>
+      <VocabularySettings revision={revision} onChanged={onChanged} />
       <ImportPanel onChanged={onChanged} />
       <section className="panel settings-panel">
         <div className="section-head">
@@ -453,6 +578,18 @@ export function SettingsView({
                   · {r.is_enabled ? "فعال" : "متوقف"}
                 </small>
               </div>
+              <button
+                className="text-button"
+                onClick={async () => {
+                  const personId = r.target_person_id ?? r.person_id;
+                  const person = personId
+                    ? await api("people/" + personId)
+                    : undefined;
+                  onWorkflow({ type: "reminder", record: r, person });
+                }}
+              >
+                ویرایش
+              </button>
               {r.is_enabled && (
                 <button
                   className="text-button"
@@ -503,6 +640,18 @@ export function SettingsView({
                   {m.error_code && " · " + m.error_code}
                 </small>
               </div>
+              <button
+                className="text-button"
+                onClick={async () => {
+                  try {
+                    setSelectedMessage(await api("messages/" + m.id));
+                  } catch (e) {
+                    setError(e as Error);
+                  }
+                }}
+              >
+                جزئیات
+              </button>
               {["unknown", "accepted"].includes(m.state) &&
                 m.channel === "sms" && (
                   <button
@@ -530,6 +679,205 @@ export function SettingsView({
           <Empty title="پیامی ثبت نشده" />
         )}
       </section>
+      {data?.messageCursor && (
+        <button
+          className="add-inline"
+          onClick={async () => {
+            try {
+              const next = await api(
+                "messages?cursor=" + encodeURIComponent(data.messageCursor),
+              );
+              setData((prev: any) => ({
+                ...prev,
+                messages: [...prev.messages, ...next.items],
+                messageCursor: next.next_cursor,
+              }));
+            } catch (e) {
+              setError(e as Error);
+            }
+          }}
+        >
+          نمایش پیام‌های بیشتر
+        </button>
+      )}
+      {selectedMessage && (
+        <section className="panel settings-panel message-settings">
+          <div className="section-head">
+            <h2>جزئیات پیام</h2>
+            <button
+              className="text-button"
+              onClick={() => setSelectedMessage(null)}
+            >
+              بستن
+            </button>
+          </div>
+          <p dir="ltr">{selectedMessage.payload?.to}</p>
+          <p className="pre-wrap">
+            {selectedMessage.payload?.text ??
+              "متن پیام هنوز نهایی نشده یا دوره نگهداری آن گذشته است."}
+          </p>
+          {selectedMessage.logs.map((log: any) => (
+            <div className="settings-record" key={log.id}>
+              <strong>
+                تلاش {fa(log.attempt_no)} ·{" "}
+                {labels[log.send_status] ?? log.send_status}
+              </strong>
+              <small>
+                {log.delivery_status
+                  ? labels[log.delivery_status]
+                  : "رسید تحویل موجود نیست"}
+                {log.error_code ? " · " + log.error_code : ""}
+              </small>
+            </div>
+          ))}
+        </section>
+      )}
     </div>
+  );
+}
+
+function VocabularySettings({
+  revision,
+  onChanged,
+}: {
+  revision: number;
+  onChanged: () => void;
+}) {
+  const [kind, setKind] = useState("tags"),
+    [items, setItems] = useState<any[]>([]),
+    [record, setRecord] = useState<any>(null),
+    [error, setError] = useState<Error | null>(null),
+    [busy, setBusy] = useState(false);
+  useEffect(() => {
+    apiAll(kind + "?active=all")
+      .then((d) => setItems(d.items))
+      .catch(setError);
+    setRecord(null);
+  }, [kind, revision]);
+  return (
+    <section className="panel settings-panel">
+      <div className="section-head">
+        <h2>تخصص‌ها، برچسب‌ها و نوع روابط</h2>
+      </div>
+      <label>
+        مدیریت
+        <select value={kind} onChange={(e) => setKind(e.target.value)}>
+          <option value="tags">تخصص و برچسب</option>
+          <option value="relationship-types">نوع رابطه</option>
+        </select>
+      </label>
+      <label>
+        ویرایش
+        <select
+          value={record?.id ?? ""}
+          onChange={(e) =>
+            setRecord(items.find((i) => i.id === e.target.value) ?? null)
+          }
+        >
+          <option value="">ساخت مورد جدید</option>
+          {items.map((i) => (
+            <option key={i.id} value={i.id}>
+              {i.name ?? i.label}
+              {!i.is_active ? " · غیرفعال" : ""}
+            </option>
+          ))}
+        </select>
+      </label>
+      <ErrorBox error={error} />
+      <form
+        className="form-stack"
+        key={kind + (record?.id ?? "new") + revision}
+        onSubmit={async (e) => {
+          e.preventDefault();
+          setBusy(true);
+          setError(null);
+          const d = Object.fromEntries(new FormData(e.currentTarget));
+          try {
+            await api(
+              kind + (record ? "/" + record.id : ""),
+              record ? "PATCH" : "POST",
+              {
+                ...d,
+                is_active: d.is_active === "on",
+                ...(kind === "relationship-types"
+                  ? { is_directed: d.is_directed === "on" }
+                  : {}),
+              },
+            );
+            onChanged();
+            toast.success("ذخیره شد.");
+          } catch (error) {
+            setError(error as Error);
+          } finally {
+            setBusy(false);
+          }
+        }}
+      >
+        {kind === "tags" ? (
+          <>
+            <label>
+              نام
+              <input
+                name="name"
+                maxLength={80}
+                required
+                defaultValue={record?.name}
+              />
+            </label>
+            <label>
+              نوع
+              <select name="kind" defaultValue={record?.kind ?? "expertise"}>
+                <option value="expertise">تخصص</option>
+                <option value="label">برچسب</option>
+              </select>
+            </label>
+          </>
+        ) : (
+          <>
+            <label>
+              کد
+              <input
+                name="code"
+                dir="ltr"
+                pattern="[a-z][a-z_]{1,39}"
+                required
+                defaultValue={record?.code}
+              />
+            </label>
+            <label>
+              عنوان
+              <input name="label" required defaultValue={record?.label} />
+            </label>
+            <label>
+              عنوان جهت معکوس
+              <input
+                name="reverse_label"
+                defaultValue={record?.reverse_label ?? ""}
+              />
+            </label>
+            <label className="check-label">
+              <input
+                type="checkbox"
+                name="is_directed"
+                defaultChecked={record?.is_directed}
+              />
+              جهت‌دار
+            </label>
+            <p className="muted">جهت نوعی که استفاده شده قابل تغییر نیست.</p>
+          </>
+        )}
+        <label className="check-label">
+          <input
+            type="checkbox"
+            name="is_active"
+            defaultChecked={record?.is_active ?? true}
+          />
+          فعال
+        </label>
+        <button className="primary" disabled={busy}>
+          ذخیره
+        </button>
+      </form>
+    </section>
   );
 }
